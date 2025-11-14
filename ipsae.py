@@ -378,6 +378,7 @@ CB_atom_num=  np.array([res['atom_num']-1 for res in cb_residues])  # for AF3 at
 coordinates = np.array([res['coor']       for res in cb_residues])
 chains = np.array(chains)
 unique_chains = np.unique(chains)
+chain_to_index = {chain: idx for idx, chain in enumerate(unique_chains)}
 token_array=np.array(token_mask)
 ntokens=np.sum(token_array)
 residue_types=np.array([res['res'] for res in residues])
@@ -466,10 +467,10 @@ if boltz1:
 
             boltz1_chain_pair_iptm_data=data_summary['pair_chains_iptm']
             for chain1 in unique_chains:
-                nchain1=  ord(chain1) - ord('A')  # map A,B,C... to 0,1,2...
+                nchain1 = chain_to_index[chain1]  # map A,B,C... to 0,1,2...
                 for chain2 in unique_chains:
                     if chain1 == chain2: continue
-                    nchain2=ord(chain2) - ord('A')
+                    nchain2 = chain_to_index[chain2]
                     iptm_boltz1[chain1][chain2]=boltz1_chain_pair_iptm_data[str(nchain1)][str(nchain2)]
     else:
         print("Boltz1 summary file does not exist: ", summary_file_path)
