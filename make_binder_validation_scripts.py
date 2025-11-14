@@ -114,20 +114,19 @@ def _alpha_suffix(idx: int) -> str:
 
 
 def _partner_chain_id(role: str, idx: int) -> str:
-    """
-    Partner chain IDs:
-        target     → TA, TB, ...
-        antitarget → AA, AB, ...
-        other      → PA, PB, ...
-    """
     role = (role or "").lower()
     if role == "target":
         prefix = "T"
     elif role == "antitarget":
         prefix = "A"
+    elif role == "self":
+        prefix = "S"
     else:
-        prefix = "P"
+        raise ValueError(
+            f"Unknown partner role: {role!r} (expected 'target', 'antitarget', or 'self')."
+        )
     return prefix + _alpha_suffix(idx)
+
 
 
 def yaml_for_pair(
@@ -231,7 +230,7 @@ def make_master_run_sh(output_root: Path) -> None:
 def make_visualisation_sh(output_root: Path) -> None:
     """Create visualization helper script."""
     lines = [
-        f"python visualise_binder_validation.py --root_dir {output_root} --generate_data --plot"
+        f"python visualise_binder_validation.py --ipsae_e 15 --ipsae_d 15 --root_dir {output_root} --generate_data --plot --use_best_model"
     ]
     sh_path = output_root / "visualise_cofolding_results.sh"
     write_text(sh_path, "\n".join(lines) + "\n")
@@ -373,8 +372,11 @@ def build_target_entities(cfg: Dict[str, Any]) -> List[Dict[str, Any]]:
             if "role" not in entry:
                 raise ValueError("targets[from_dir] entry must have a 'role' (target/antitarget).")
             role = str(entry["role"]).lower()
-            if role not in {"target", "antitarget"}:
-                raise ValueError(f"Invalid role {role!r} (expected 'target' or 'antitarget').")
+            if role not in {"target", "antitarget", "self"}:
+                raise ValueError(
+                    f"Target {name}: invalid role {role!r} (expected 'target', 'antitarget', or 'self')."
+                )
+
             dir_path = Path(entry["from_dir"]).resolve()
             if not dir_path.is_dir():
                 raise ValueError(f"Targets from_dir not found: {dir_path}")
@@ -394,10 +396,15 @@ def build_target_entities(cfg: Dict[str, Any]) -> List[Dict[str, Any]]:
 
         name = sanitize_name(entry["name"])
         role = str(entry["role"]).lower()
-        if role not in {"target", "antitarget"}:
+        if role not in {"target", "antitarget", "self"}:
             raise ValueError(
-                f"Target {name}: invalid role {role!r} (expected 'target' or 'antitarget')."
+                f"Target {name}: invalid role {role!r} (expected 'target', 'antitarget', or 'self')."
             )
+        if role == "self":
+            seqs = []   # placeholder to indicate "binder will fill this"
+            msas = []   # placeholder for binder MSAs
+            result.append({"name": name, "role": "self", "seqs": seqs, "msas": msas})
+            continue
 
         # Sequences source: either 'sequences' or 'fasta'
         seqs: Optional[List[str]] = None
@@ -456,8 +463,10 @@ def main():
     targets = [t for t in targets_all if t["role"] == "target"]
     antitargets = [t for t in targets_all if t["role"] == "antitarget"]
 
-    if not targets and not antitargets:
-        sys.exit("ERROR: Must have at least one target or antitarget defined.")
+    if len(targets_all) == 0:
+        sys.exit("ERROR: Must have at least one target/antitarget/self entry.")
+
+
 
     # Boltz defaults
     boltz_cfg = get_global_option(cfg, "boltz", default={}) or {}
@@ -466,6 +475,7 @@ def main():
     use_msa_server_mode = str(boltz_cfg.get("use_msa_server", "auto")).lower()
     if use_msa_server_mode not in {"auto", "true", "false"}:
         sys.exit("ERROR: global.boltz.use_msa_server must be 'auto', 'true', or 'false'.")
+
 
     # --- Generate YAMLs and run.sh for each binder ---
     for binder in binders:
@@ -479,44 +489,55 @@ def main():
         yaml_paths: List[Path] = []
         any_pair_uses_msa = False
 
-        # Binder vs targets
-        for tgt in targets:
-            tname = tgt["name"]
-            tseqs = tgt["seqs"]
-            tmsas = tgt["msas"]
+        # Loop over ALL partner entities (targets, antitargets, self)
+        for tgt in targets_all:
 
-            yname = f"binder_{bname}_vs_target_{tname}.yaml"
-            ypath = binder_dir / yname
-            text = yaml_for_pair(bseqs, tseqs, partner_role="target",
-                                 binder_msas=bmsas, partner_msas=tmsas)
+            role = tgt["role"]
+
+            # --- SELF CASE ---
+            if role == "self":
+                partner_name = "self"
+                tseqs = bseqs[:]              # copy binder seqs
+                tmsas = bmsas[:]              # copy binder MSAs
+                yaml_name = f"binder_{bname}_vs_self.yaml"
+
+            # --- NORMAL TARGET ---
+            elif role == "target":
+                partner_name = tgt["name"]
+                tseqs = tgt["seqs"]
+                tmsas = tgt["msas"]
+                yaml_name = f"binder_{bname}_vs_target_{partner_name}.yaml"
+
+            # --- ANTITARGET ---
+            elif role == "antitarget":
+                partner_name = tgt["name"]
+                tseqs = tgt["seqs"]
+                tmsas = tgt["msas"]
+                yaml_name = f"binder_{bname}_vs_antitarget_{partner_name}.yaml"
+
+            else:
+                raise ValueError(f"Unknown target role: {role}")
+
+            ypath = binder_dir / yaml_name
+            text = yaml_for_pair(
+                bseqs,
+                tseqs,
+                partner_role=role,
+                binder_msas=bmsas,
+                partner_msas=tmsas,
+            )
             write_text(ypath, text)
             yaml_paths.append(ypath)
 
             if any(bmsas) or any(tmsas):
                 any_pair_uses_msa = True
 
-        # Binder vs antitargets
-        for at in antitargets:
-            aname = at["name"]
-            aseqs = at["seqs"]
-            amsas = at["msas"]
-
-            yname = f"binder_{bname}_vs_antitarget_{aname}.yaml"
-            ypath = binder_dir / yname
-            text = yaml_for_pair(bseqs, aseqs, partner_role="antitarget",
-                                 binder_msas=bmsas, partner_msas=amsas)
-            write_text(ypath, text)
-            yaml_paths.append(ypath)
-
-            if any(bmsas) or any(amsas):
-                any_pair_uses_msa = True
-
-        # Decide use_msa_server for this binder
+        # Decide whether to use MSA server
         if use_msa_server_mode == "true":
             use_msa_server = True
         elif use_msa_server_mode == "false":
             use_msa_server = False
-        else:  # auto
+        else:
             use_msa_server = not any_pair_uses_msa
 
         make_run_sh(

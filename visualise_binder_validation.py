@@ -32,6 +32,7 @@ This script:
 """
 
 import argparse
+from fileinput import filename
 import subprocess
 import re
 import os
@@ -42,10 +43,31 @@ import matplotlib.pyplot as plt
 from pathlib import Path
 
 
+def classify(chain_id):
+    # Binder chains: A, B, C ...
+    if len(chain_id) == 1 and chain_id.isupper():
+        return "binder"
+
+    # Self-chains: SA, SB, SC ...
+    if chain_id.startswith("S"):
+        return "self"
+
+    # Targets: TA, TB, ...
+    if chain_id.startswith("T"):
+        return "target"
+
+    # Antitarget: AA, AB, ...
+    if chain_id.startswith("A") and len(chain_id) > 1:
+        return "antitarget"
+
+    return "other"
+
+
+
 def run_ipsae(
     pae_file,
     cif_file,
-    pae_cutoff=10,
+    pae_cutoff=15,
     dist_cutoff=15,
     chain_of_focus="A"
 ):
@@ -76,29 +98,34 @@ def run_ipsae(
 
     out_txt = str(cif_file).replace(".cif", f"_{pae_cutoff}_{dist_cutoff}.txt")
     if not os.path.exists(out_txt):
-        raise FileNotFoundError(f"Missing ipSAE output: {out_txt}")
+        raise FileNotFoundError(f"Missing ipSAE output: {out_txt}.\nCommand was: {' '.join(cmd)}")
 
     # ---------------------------
     # Load table
-    # ---------------------------
-    try:
-        df = pd.read_csv(out_txt, sep=None, engine="python")
-    except Exception:
-        df = pd.read_csv(out_txt, delim_whitespace=True)
 
-    # Convert numeric where possible
-    for col in df.columns:
-        df[col] = pd.to_numeric(df[col], errors="ignore")
+    df = pd.read_fwf(out_txt)
+
+    df["Type"] = df["Type"].astype(str).str.lower().str.strip()
+    df = df[df["Type"].str.contains("asym", na=False)]
 
     # Required columns
     chn1_col = "Chn1"
     chn2_col = "Chn2"
-    type_col = "Type"
 
-    # ---------------------------
-    # Keep only ASYM rows
-    # ---------------------------
-    df = df[df[type_col].str.lower() == "asym"]
+    # Compute category for each chain
+    df["cat1"] = df[chn1_col].apply(classify)
+    df["cat2"] = df[chn2_col].apply(classify)
+
+    # Keep only binder–target or binder–antitarget pairs
+    df = df[
+        ((df["cat1"] == "binder") & (df["cat2"].isin(["target", "antitarget"]))) |
+        ((df["cat2"] == "binder") & (df["cat1"].isin(["target", "antitarget"])))
+    ]
+
+    if df.empty:
+        raise ValueError(f"No valid binder–target/antitarget ASYM rows for chain {chain_of_focus}")
+
+
 
     # ---------------------------
     # Keep only rows where focus chain appears
@@ -160,23 +187,27 @@ def run_ipsae(
 
 def parse_vs_name(vs_name: str):
     """
-    Parse vs_name of the form:
-        binder_<binder>_vs_target_<partner>
-        binder_<binder>_vs_antitarget_<partner>
-    Returns (partner_name, target_type).
+    Parse:
+        binder_<binder>_vs_target_<name>
+        binder_<binder>_vs_antitarget_<name>
+        binder_<binder>_vs_self
     """
-    m = re.search(r"_vs_(target|antitarget)_(.*)$", vs_name)
+    m = re.search(r"_vs_(target|antitarget|self)_(.*)$", vs_name)
     if m:
-        target_type = m.group(1)  # 'target' or 'antitarget'
-        partner_name = m.group(2)
-    else:
-        target_type = "unknown"
-        m2 = re.search(r"_vs_(.*)$", vs_name)
-        partner_name = m2.group(1) if m2 else vs_name
-    return partner_name, target_type
+        role = m.group(1)
+        partner = m.group(2)
+        return partner, role
+
+    # self without a partner name (binder_X_vs_self)
+    m2 = re.search(r"_vs_(self)$", vs_name)
+    if m2:
+        return "self", "self"
+
+    return vs_name, "unknown"
 
 
-def analyse_binder(binder_dir: Path):
+
+def analyse_binder(binder_dir: Path ,args):
     """
     Analyse a binder directory: compute ipSAE for all vs_* pairs, save plots.
     """
@@ -201,7 +232,7 @@ def analyse_binder(binder_dir: Path):
                 continue
 
             try:
-                rec = run_ipsae(pae_file, cif_file, chain_of_focus="A")
+                rec = run_ipsae(pae_file, cif_file, chain_of_focus="A",pae_cutoff=int(args.ipsae_e), dist_cutoff=int(args.ipsae_d))
             except Exception as e:
                 print(f"⚠️ ipSAE failed for {pae_file} ({e}). Skipping.")
                 continue
@@ -261,10 +292,9 @@ def analyse_binder(binder_dir: Path):
     print(f"Saved: {csv_path}")
 
 
-def plot_overall(root_dir: Path):
+def plot_overall(root_dir: Path, use_best_model: bool = False):
     """
-    Combine all per-binder CSVs and plot heatmaps for ipSAE_min and ipSAE_max
-    (averages across models).
+    Combine all per-binder CSVs and plot heatmaps for ipSAE_min and ipSAE_max.
 
     All targets & antitargets are pooled together; target_type is kept in the
     DataFrame but not used to split the plots (for now).
@@ -293,16 +323,54 @@ def plot_overall(root_dir: Path):
         print("No ipSAE_min/ipSAE_max metrics found for heatmap plotting.")
         return
 
-    agg = all_df.groupby(["binder_short", "partner"])[metrics].mean().reset_index()
+    # ------------------------------------------------------
+    # AGGREGATION ACROSS MODELS
+    # ------------------------------------------------------
+    if use_best_model and "ipSAE_min" in all_df.columns:
+        # pick the row (i.e. model) with lowest ipSAE_min per binder/partner
+        idx = all_df.groupby(["binder_short", "partner"])["ipSAE_min"].idxmax()
+        agg_base = all_df.loc[idx].copy()   # still has target_type
+    else:
+        # use all rows as base for ordering & averaging
+        agg_base = all_df.copy()
 
-    partners = sorted(agg["partner"].unique().tolist())
-    binders = sorted(agg["binder_short"].unique().tolist())
+    # This is what we actually plot (average across models or best-model rows)
+    agg = agg_base.groupby(["binder_short", "partner"])[metrics].mean().reset_index()
 
+    # ------------------------------------------------------
+    # ORDER BY BEST BINDING TO TARGET (LOWEST ipSAE_min)
+    # ------------------------------------------------------
+    # Use only true targets (NOT antitargets) to measure "binding quality"
+    targets_only = agg_base[agg_base["target_type"] == "target"]
+
+    # If for some reason no targets exist, fall back to all partners
+    source = targets_only if not targets_only.empty else agg_base
+
+    # Binders ordered by highest ipSAE_min (bigger = better)
+    binder_order = (
+        agg.groupby("binder_short")["ipSAE_min"]
+        .max()                        # biggest = best binding
+        .sort_values(ascending=False) # best → worst
+        .index
+        .tolist()
+    )
+
+    # Do NOT reorder rows (targets/antitargets)
+    partner_order = sorted(agg["partner"].unique().tolist())
+
+    # Optional: print to verify in logs
+    print("Binder order (best→worst by ipSAE_min on targets):", binder_order,"\n")
+    # ------------------------------------------------------
+    # PLOT HEATMAPS (BOTH USING ipSAE_min-BASED ORDERING)
+    # ------------------------------------------------------
     for metric in metrics:
         pivot = agg.pivot(index="partner", columns="binder_short", values=metric)
-        pivot = pivot.reindex(index=partners, columns=binders)
 
-        plt.figure(figsize=(max(7, len(binders) * 0.7), max(5, len(partners) * 0.4)))
+        # enforce ordering explicitly
+        pivot = pivot.reindex(index=partner_order, columns=binder_order)
+
+        plt.figure(figsize=(max(7, len(binder_order) * 0.7),
+                            max(5, len(partner_order) * 0.4)))
         sns.heatmap(
             pivot,
             annot=True,
@@ -320,26 +388,47 @@ def plot_overall(root_dir: Path):
         plt.tight_layout()
 
         for ext in ["png", "svg"]:
-            plt.savefig(root_dir / f"{metric}_heatmap_chainA.{ext}", dpi=300)
-
+            path = root_dir / f"{metric}_heatmap_chainA.{ext}"
+            plt.savefig(path, dpi=300)
+            print(f"Saved heatmap for {metric} at {path}")
         plt.close()
-        print(f"Saved heatmap for {metric}")
+
 
 
 def main():
     ap = argparse.ArgumentParser()
+    ap.add_argument("--ipsae_e", type=int, default=15,
+                    help="ipSAE PAE cutoff (default: 15 Å)")
+    ap.add_argument("--ipsae_d", type=int, default=15,
+                    help="ipSAE distance cutoff (default: 15 Å)")
     ap.add_argument("--root_dir", required=True)
     ap.add_argument("--generate_data", action="store_true")
     ap.add_argument("--plot", action="store_true")
+    ap.add_argument(
+        "--use_best_model",
+        action="store_true",
+        help="Use only the best model (highest ipSAE_max) per binder/partner instead of averaging"
+    )
+    ap.add_argument("--num_cpu", type=int, default=1,
+                    help="Number of CPUs for parallel processing")
     args = ap.parse_args()
+
 
     root = Path(args.root_dir)
     if args.generate_data:
-        for binder_dir in sorted(root.glob("binder_*")):
-            if binder_dir.is_dir():
-                analyse_binder(binder_dir)
+        binder_dirs = [d for d in sorted(root.glob("binder_*")) if d.is_dir()]
+        if args.num_cpu == 1:
+            # sequential
+            for d in binder_dirs:
+                analyse_binder(d,args)
+        else:
+            # parallel
+            from multiprocessing import Pool
+            with Pool(processes=args.num_cpu) as pool:
+                pool.map(analyse_binder, binder_dirs, [args]*len(binder_dirs))
+
     if args.plot:
-        plot_overall(root)
+        plot_overall(root, use_best_model=args.use_best_model)
 
 
 if __name__ == "__main__":

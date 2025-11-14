@@ -1,0 +1,1 @@
+python ../make_binder_validation_scripts.py --config config.yaml
