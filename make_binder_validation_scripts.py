@@ -209,13 +209,16 @@ def make_run_sh(
 
 
 def make_master_run_sh(output_root: Path) -> None:
-    """Generate top-level script to run all binder run.sh scripts."""
+    """Generate top-level script to run all binder run.sh scripts with paths relative to the script itself."""
     lines = [
         "#!/bin/bash",
         "set -e",
         "",
-        "# Run all binder_* run.sh scripts",
-        'for f in $(find . -type f -name "run.sh" | sort); do',
+        '# Determine directory of this script',
+        'DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )"',
+        "",
+        "# Run all binder_* run.sh scripts relative to script location",
+        'for f in $(find "$DIR" -type f -name "run.sh" | sort); do',
         '  echo "Running $f..."',
         '  (cd "$(dirname "$f")" && bash run.sh)',
         "done",
@@ -225,6 +228,7 @@ def make_master_run_sh(output_root: Path) -> None:
     write_text(run_all_path, "\n".join(lines))
     os.chmod(run_all_path, 0o755)
     print(f"✅ Created {run_all_path}")
+
 
 
 def make_visualisation_sh(output_root: Path) -> None:

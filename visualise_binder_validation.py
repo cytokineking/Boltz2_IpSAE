@@ -118,8 +118,8 @@ def run_ipsae(
 
     # Keep only binder–target or binder–antitarget pairs
     df = df[
-        ((df["cat1"] == "binder") & (df["cat2"].isin(["target", "antitarget"]))) |
-        ((df["cat2"] == "binder") & (df["cat1"].isin(["target", "antitarget"])))
+        ((df["cat1"] == "binder") & (df["cat2"].isin(["target", "antitarget","self"]))) |
+        ((df["cat2"] == "binder") & (df["cat1"].isin(["target", "antitarget","self"])))
     ]
 
     if df.empty:
@@ -273,7 +273,7 @@ def analyse_binder(binder_dir: Path ,args):
         short_title = re.sub(r"^binder_", "", binder_dir.name)
         plt.title(f"{metric} for {short_title}")
         plt.ylabel(metric)
-        plt.xlabel("Target / Antitarget")
+        plt.xlabel("Target / Antitarget / Self")
         plt.xticks(rotation=30)
         handles, labels = plt.gca().get_legend_handles_labels()
         if labels:
@@ -382,7 +382,7 @@ def plot_overall(root_dir: Path, use_best_model: bool = False):
             vmax=1,
         )
         plt.title(metric)
-        plt.ylabel("Target / Antitarget", rotation=90)
+        plt.ylabel("Target / Antitarget / Self", rotation=90)
         plt.xlabel("Binder")
         plt.yticks(rotation=0)
         plt.tight_layout()
@@ -425,7 +425,7 @@ def main():
             # parallel
             from multiprocessing import Pool
             with Pool(processes=args.num_cpu) as pool:
-                pool.map(analyse_binder, binder_dirs, [args]*len(binder_dirs))
+                pool.starmap(analyse_binder, [(d, args) for d in binder_dirs])
 
     if args.plot:
         plot_overall(root, use_best_model=args.use_best_model)
