@@ -264,6 +264,28 @@ def analyse_binder(binder_dir: Path ,args):
             except Exception as e:
                 print(f"⚠️ ipSAE failed for {pae_file} ({e}). Skipping.")
                 continue
+            # -----------------------------------------------------------
+            # Add sequences from YAML (binder1, binder2, target1, ...)
+            # -----------------------------------------------------------
+            yaml_path = binder_dir / f"{vs_name}.yaml"
+
+            binder_seqs, target_seqs, antitarget_seqs, self_seqs = extract_sequences_from_yaml(yaml_path)
+
+            # binder may have multiple chains
+            if len(binder_seqs) <= 1:
+                rec["binder_sequence"] = binder_seqs[0] if binder_seqs else ""
+            else:
+                rec["binder_sequence"] = ":".join(binder_seqs)
+
+            # partner (target/antitarget/self) is mutually exclusive
+            partner_list = target_seqs or antitarget_seqs or self_seqs
+
+            if len(partner_list) <= 1:
+                rec["target_sequence"] = partner_list[0] if partner_list else ""
+            else:
+                rec["target_sequence"] = ":".join(partner_list)
+
+
 
             rec.update({
                 "binder": binder_dir.name,
@@ -280,7 +302,7 @@ def analyse_binder(binder_dir: Path ,args):
 
     df = pd.DataFrame(binder_records)
 
-    csv_path = plots_dir / "ipsae_summary_chainA.csv"
+    csv_path = plots_dir / "ipsae_summary.csv"
     df.to_csv(csv_path, index=False)
 
     metrics = ["ipSAE_min", "ipSAE_max"]
@@ -312,12 +334,47 @@ def analyse_binder(binder_dir: Path ,args):
                 title="model_idx",
                 loc="best",
             )
+            
         plt.tight_layout()
         for ext in ["png"]:
-            plt.savefig(plots_dir / f"{metric}_stripplot_chainA.{ext}", dpi=200)
+            plt.savefig(plots_dir / f"{metric}_stripplot.{ext}", dpi=200)
         plt.close()
 
     print(f"Saved: {csv_path}")
+
+import yaml
+
+def extract_sequences_from_yaml(yaml_path):
+    with open(yaml_path, "r") as f:
+        y = yaml.safe_load(f)
+
+    binder_seqs = []
+    target_seqs = []
+    antitarget_seqs = []
+    self_seqs = []
+
+    for entry in y.get("sequences", []):
+        prot = entry.get("protein", {})
+        cid = prot.get("id", "")
+        seq = prot.get("sequence", "")
+
+        # Binder: A, B, C...
+        if len(cid) == 1 and cid.isupper():
+            binder_seqs.append(seq)
+
+        # Target: TA, TB, ...
+        elif cid.startswith("T") and len(cid) > 1:
+            target_seqs.append(seq)
+
+        # Antitarget: AA, AB, ...
+        elif cid.startswith("A") and len(cid) > 1:
+            antitarget_seqs.append(seq)
+
+        # Self: SA, SB, ...
+        elif cid.startswith("S") and len(cid) > 1:
+            self_seqs.append(seq)
+
+    return binder_seqs, target_seqs, antitarget_seqs, self_seqs
 
 
 def plot_overall(root_dir: Path, use_best_model: bool = False):
@@ -327,7 +384,7 @@ def plot_overall(root_dir: Path, use_best_model: bool = False):
     All targets & antitargets are pooled together; target_type is kept in the
     DataFrame but not used to split the plots (for now).
     """
-    csvs = list(root_dir.glob("binder_*/plots/ipsae_summary_chainA.csv"))
+    csvs = list(root_dir.glob("binder_*/plots/ipsae_summary.csv"))
     if not csvs:
         print("No binder CSVs found.")
         return
@@ -335,6 +392,7 @@ def plot_overall(root_dir: Path, use_best_model: bool = False):
     dfs = []
     for csv in csvs:
         df = pd.read_csv(csv)
+
         # Backwards compatibility: older CSVs may not have 'partner' or 'target_type'
         if "partner" not in df.columns and "vs" in df.columns:
             df["partner"] = df["vs"].str.extract(r"_vs_(.*)$")
@@ -345,11 +403,23 @@ def plot_overall(root_dir: Path, use_best_model: bool = False):
         dfs.append(df)
 
     all_df = pd.concat(dfs, ignore_index=True)
+    binder_sequences = all_df.groupby("binder_short")["binder_sequence"].first().to_dict()
 
-    metrics = [m for m in ["ipSAE_min", "ipSAE_max"] if m in all_df.columns]
+
+    # Add the binder_sequence column
+    all_df["binder_sequence"] = all_df["binder_short"].map(binder_sequences)
+
+    metrics = [m for m in ["ipSAE_min"] if m in all_df.columns]
     if not metrics:
         print("No ipSAE_min/ipSAE_max metrics found for heatmap plotting.")
         return
+    
+    # save all_df for reference
+    # make dir summary
+    Path.mkdir(root_dir/ "summary" ,exist_ok=True)
+    all_df_path = root_dir/ "summary" / "ipsae_summary_all_binders.csv"
+    all_df.to_csv(all_df_path, index=False)
+    print(f"Saved combined ipSAE data at {all_df_path}")
 
     # ------------------------------------------------------
     # AGGREGATION ACROSS MODELS
@@ -361,6 +431,8 @@ def plot_overall(root_dir: Path, use_best_model: bool = False):
     else:
         # use all rows as base for ordering & averaging
         agg_base = all_df.copy()
+
+
 
     # This is what we actually plot (average across models or best-model rows)
     agg = agg_base.groupby(["binder_short", "partner"])[metrics].mean().reset_index()
@@ -384,7 +456,12 @@ def plot_overall(root_dir: Path, use_best_model: bool = False):
     )
 
     # Do NOT reorder rows (targets/antitargets)
-    partner_order = sorted(agg["partner"].unique().tolist())
+    type_map = agg_base.groupby("partner")["target_type"].first().to_dict()
+
+    # partner_order = antitargets + targets + self_group
+    partner_order = ["self", "target", "antitarget"]
+
+    print("Partner order:", partner_order)
 
     # Optional: print to verify in logs
     print("Binder order (best→worst by ipSAE_min on targets):", binder_order,"\n")
@@ -392,9 +469,11 @@ def plot_overall(root_dir: Path, use_best_model: bool = False):
     # PLOT HEATMAPS (BOTH USING ipSAE_min-BASED ORDERING)
     # ------------------------------------------------------
     for metric in metrics:
-        pivot = agg.pivot(index="partner", columns="binder_short", values=metric)
+        # ----------------------------------------------------------
+        # Replace partner names with their class
+        agg["partner_class"] = agg["partner"].map(type_map)
 
-        # enforce ordering explicitly
+        pivot = agg.pivot(index="partner_class", columns="binder_short", values=metric)
         pivot = pivot.reindex(index=partner_order, columns=binder_order)
 
         plt.figure(figsize=(max(7, len(binder_order) * 0.7),
@@ -410,18 +489,34 @@ def plot_overall(root_dir: Path, use_best_model: bool = False):
             vmax=1,
         )
         plt.title(metric)
-        plt.ylabel("Target / Antitarget / Self", rotation=90)
+        plt.ylabel("Self / Target / Antitarget ", rotation=90)
         plt.xlabel("Binder")
         plt.yticks(rotation=0)
-        plt.tight_layout()
+        # plt.tight_layout()
 
         for ext in ["png", "svg"]:
-            path = root_dir / f"{metric}_heatmap_chainA.{ext}"
-            plt.savefig(path, dpi=300)
+            path = root_dir/ "summary"  / f"{metric}_heatmap.{ext}"
+            plt.savefig(path, dpi=300, bbox_inches="tight")
             print(f"Saved heatmap for {metric} at {path}")
         plt.close()
 
+        # save CSV (rows = binders, columns = targets)
+        csv_out = root_dir/ "summary"  / f"{metric}_heatmap.csv"
 
+        # Add binder_sequence to the final exported heatmap CSV
+        # ----------------------------------------------------------
+        pivot_out = pivot.T.copy()  # rows = binders
+
+        pivot_out.insert(
+            0,
+            "binder_sequence",
+            pivot_out.index.map(binder_sequences)
+        )
+
+
+        pivot_out.to_csv(csv_out, float_format="%.5f")
+
+        print(f"Saved heatmap data for {metric} as {csv_out}")
 
 def main():
     ap = argparse.ArgumentParser()
