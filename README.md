@@ -167,6 +167,19 @@ Optional binder tweak:
 - `--use_best_model` (affects global heatmap aggregation only)
 - `--num_cpu 4` (used for the final global stage in `visualise_binder_validation`).
 
+**Multi-GPU / resume options**:
+
+- `--gpus`:
+  - Omitted → sequential, single-worker behavior (one binder at a time).
+  - `--gpus all` → use all available CUDA GPUs on the machine.
+  - `--gpus 0,1,2` → use the listed GPU IDs, one worker process per GPU.
+- `--resume`:
+  - Reuses an existing `--out_dir` and detects which binders still need Boltz/ipSAE/summary work.
+  - Fully completed binders (with predictions, `ipsae_summary.csv`, and a summary row) are skipped.
+- `--overwrite`:
+  - Deletes `--out_dir` if it exists and starts from scratch.
+  - Mutually exclusive with `--resume`.
+
 Logging:
 
 - Default: clean stage/progress messages, logs written under `out_dir/logs/`.
@@ -231,7 +244,7 @@ For each binder the script:
 2. Runs ipSAE on those predictions.
 3. Prints binder‑level ipSAE summaries (target and antitarget).
 4. Appends one row to:
-   - `Boltz2_IpSAE/example_yaml/boltz_ipsae_nipah/summary/binder_pair_summary.csv`
+   - `example_yaml/boltz_ipsae_nipah/summary/binder_pair_summary.csv`
 
 After all binders are processed, it also writes:
 

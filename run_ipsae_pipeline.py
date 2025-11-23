@@ -20,11 +20,15 @@ from __future__ import annotations
 
 import argparse
 import csv
+import multiprocessing as mp
+import os
+import shutil
 import subprocess
 import sys
 import types
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 
 import pandas as pd
 
@@ -201,6 +205,34 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=1,
         help="Number of CPUs to use for ipSAE scoring (default: 1, used for global stage).",
+    )
+
+    # Multi-GPU and resume/overwrite controls
+    ap.add_argument(
+        "--gpus",
+        type=str,
+        default=None,
+        help=(
+            "Comma-separated list of GPU IDs to use (e.g. '0' or '0,1,2'), "
+            "or 'all' to use all available GPUs. "
+            "If omitted, run sequentially on a single GPU/CPU."
+        ),
+    )
+    ap.add_argument(
+        "--resume",
+        action="store_true",
+        help=(
+            "Resume in-place in an existing out_dir: detect completed binders and "
+            "only run missing Boltz/ipSAE/summary steps."
+        ),
+    )
+    ap.add_argument(
+        "--overwrite",
+        action="store_true",
+        help=(
+            "Delete out_dir if it exists and start from scratch. "
+            "Mutually exclusive with --resume."
+        ),
     )
 
     ap.add_argument(
@@ -398,21 +430,22 @@ def run_subprocess(
     return proc.returncode
 
 
-def append_binder_summary(
-    binder_dir: Path,
-    out_root: Path,
-    metric_preference: str = "ipSAE_min",
-) -> None:
+def compute_binder_summary(
+    binder_dir: Path, metric_preference: str = "ipSAE_min"
+) -> Optional[Tuple[str, str, Optional[float], Optional[float], Optional[float], Optional[float], int, int]]:
     """
     Read binder_*/plots/ipsae_summary.csv, compute mean/std of selected metric
-    for target and antitarget, append a one-row summary to out_root/summary/*.csv
-    and print the values.
+    for target and antitarget, and return a summary tuple:
+
+        (binder_name, metric_col, tgt_mean, tgt_std, at_mean, at_std, tgt_n, at_n)
+
+    Returns None if no suitable data is found.
     """
     plots_dir = binder_dir / "plots"
     csv_path = plots_dir / "ipsae_summary.csv"
     if not csv_path.is_file():
         print(f"    !! No ipsae_summary.csv for {binder_dir.name}; skipping summary row.")
-        return
+        return None
 
     df = pd.read_csv(csv_path)
 
@@ -425,7 +458,7 @@ def append_binder_summary(
     metric_col = next((m for m in preferred if m in df.columns), None)
     if metric_col is None:
         print(f"    !! No ipSAE metric columns found in {csv_path}; skipping summary row.")
-        return
+        return None
 
     binder_short = binder_dir.name.replace("binder_", "", 1)
 
@@ -440,6 +473,49 @@ def append_binder_summary(
 
     tgt_mean, tgt_std, tgt_n = stats_for_type("target")
     at_mean, at_std, at_n = stats_for_type("antitarget")
+
+    return (
+        binder_short,
+        metric_col,
+        tgt_mean,
+        tgt_std,
+        at_mean,
+        at_std,
+        tgt_n,
+        at_n,
+    )
+
+
+def append_binder_summary_row(
+    out_root: Path,
+    summary: Tuple[
+        str,
+        str,
+        Optional[float],
+        Optional[float],
+        Optional[float],
+        Optional[float],
+        int,
+        int,
+    ],
+    completed_binders: Optional[set[str]] = None,
+    print_to_console: bool = True,
+) -> None:
+    """
+    Append a one-row summary to out_root/summary/binder_pair_summary.csv.
+    summary is the tuple returned by compute_binder_summary.
+    completed_binders, if provided, is updated with binder_name.
+    """
+    (
+        binder_short,
+        metric_col,
+        tgt_mean,
+        tgt_std,
+        at_mean,
+        at_std,
+        tgt_n,
+        at_n,
+    ) = summary
 
     # Print to console
     if tgt_n > 0:
@@ -490,12 +566,377 @@ def append_binder_summary(
             ]
         )
 
+    if completed_binders is not None:
+        completed_binders.add(binder_short)
+
+
+@dataclass
+class BinderTask:
+    name: str
+    seqs: List[str]
+    msas: List[Optional[str]]
+    needs_boltz: bool = True
+    needs_ipsae: bool = True
+    needs_summary_row: bool = True
+
+
+def _expected_yaml_stems(
+    binder_name: str, partners: List[Dict[str, object]], include_self: bool
+) -> List[str]:
+    stems: List[str] = []
+    for partner in partners:
+        role = partner["role"]  # type: ignore[index]
+        pname = partner["name"]  # type: ignore[index]
+        stems.append(f"binder_{binder_name}_vs_{role}_{pname}")
+    if include_self:
+        stems.append(f"binder_{binder_name}_vs_self")
+    return stems
+
+
+def _stem_has_predictions(binder_dir: Path, stem: str) -> bool:
+    pred_root = (
+        binder_dir
+        / "outputs"
+        / f"boltz_results_{stem}"
+        / "predictions"
+        / stem
+    )
+    if not pred_root.is_dir():
+        return False
+    return any(pred_root.glob("pae_*_model_*.npz"))
+
+
+def binder_has_all_predictions(
+    binder_dir: Path,
+    binder_name: str,
+    partners: List[Dict[str, object]],
+    include_self: bool,
+) -> bool:
+    stems = _expected_yaml_stems(binder_name, partners, include_self)
+    if not stems:
+        return False
+    return all(_stem_has_predictions(binder_dir, stem) for stem in stems)
+
+
+def build_binder_tasks(
+    binders: List[Dict[str, object]],
+    partners: List[Dict[str, object]],
+    out_root: Path,
+    include_self: bool,
+    resume: bool,
+) -> List[BinderTask]:
+    """
+    Construct BinderTask list with needs_boltz/needs_ipsae/needs_summary_row flags.
+    """
+    tasks: List[BinderTask] = []
+
+    # Preload completed binder names from existing summary, if any
+    summary_path = out_root / "summary" / "binder_pair_summary.csv"
+    completed_binders: set[str] = set()
+    if resume and summary_path.is_file():
+        df = pd.read_csv(summary_path)
+        if "binder_name" in df.columns:
+            completed_binders = set(df["binder_name"].astype(str))
+
+    if not resume:
+        for binder in binders:
+            tasks.append(
+                BinderTask(
+                    name=binder["name"],  # type: ignore[index]
+                    seqs=binder["seqs"],  # type: ignore[index]
+                    msas=binder["msas"],  # type: ignore[index]
+                    needs_boltz=True,
+                    needs_ipsae=True,
+                    needs_summary_row=True,
+                )
+            )
+        return tasks
+
+    # Resume mode: inspect existing outputs
+    for binder in binders:
+        name = binder["name"]  # type: ignore[index]
+        seqs = binder["seqs"]  # type: ignore[index]
+        msas = binder["msas"]  # type: ignore[index]
+
+        binder_dir = out_root / f"binder_{name}"
+        needs_boltz = True
+        needs_ipsae = True
+        needs_summary_row = True
+
+        if binder_dir.is_dir():
+            # Boltz predictions
+            has_all = binder_has_all_predictions(
+                binder_dir, name, partners, include_self
+            )
+            needs_boltz = not has_all
+
+            # ipSAE summaries
+            ipsae_csv = binder_dir / "plots" / "ipsae_summary.csv"
+            needs_ipsae = not ipsae_csv.is_file()
+
+        # Summary row: only skip if we have both ipsae_summary.csv and an existing row
+        if name in completed_binders and not needs_ipsae:
+            needs_summary_row = False
+        else:
+            needs_summary_row = True
+
+        if not (needs_boltz or needs_ipsae or needs_summary_row):
+            # Fully complete binder
+            continue
+
+        tasks.append(
+            BinderTask(
+                name=name,
+                seqs=seqs,
+                msas=msas,
+                needs_boltz=needs_boltz,
+                needs_ipsae=needs_ipsae,
+                needs_summary_row=needs_summary_row,
+            )
+        )
+
+    return tasks
+
+
+def parse_gpus_arg(gpus_arg: Optional[str]) -> Optional[List[int]]:
+    """
+    Parse --gpus argument into a list of GPU IDs, or None for sequential mode.
+    """
+    if gpus_arg is None:
+        return None
+
+    gpus_arg = gpus_arg.strip()
+    if not gpus_arg:
+        return None
+
+    if gpus_arg.lower() == "all":
+        try:
+            import torch  # type: ignore[import]
+        except ImportError as exc:  # pragma: no cover
+            raise SystemExit(
+                f"ERROR: --gpus all requested but torch is not installed ({exc})."
+            )
+        if not torch.cuda.is_available():
+            raise SystemExit("ERROR: --gpus all requested but no CUDA device is available.")
+        n_gpus = torch.cuda.device_count()
+        if n_gpus <= 0:
+            raise SystemExit("ERROR: --gpus all requested but torch reports zero GPUs.")
+        return list(range(n_gpus))
+
+    # Comma-separated list
+    parts = [p.strip() for p in gpus_arg.split(",") if p.strip()]
+    if not parts:
+        return None
+    try:
+        gpu_ids = [int(p) for p in parts]
+    except ValueError:
+        raise SystemExit(f"ERROR: Could not parse --gpus value {gpus_arg!r} as a list of integers.")
+    return gpu_ids
+
+
+def worker_loop(
+    gpu_id: int,
+    task_queue: "mp.Queue[Optional[BinderTask]]",
+    summary_queue: "mp.Queue[Tuple[str, str, Optional[float], Optional[float], Optional[float], Optional[float], int, int]]",
+    partners: List[Dict[str, object]],
+    out_root: Path,
+    logs_dir: Path,
+    ipsae_args: types.SimpleNamespace,
+    args: argparse.Namespace,
+) -> None:
+    """
+    Worker process: pulls BinderTask objects, runs Boltz/ipSAE, and sends summary rows.
+    """
+    # Limit this worker to a single GPU (if using CUDA)
+    os.environ["CUDA_VISIBLE_DEVICES"] = str(gpu_id)
+
+    # Import visualisation module inside worker
+    script_dir = Path(__file__).resolve().parent
+    if str(script_dir) not in sys.path:
+        sys.path.insert(0, str(script_dir))
+    try:
+        import visualise_binder_validation as viz  # type: ignore[import]
+    except ImportError as exc:  # pragma: no cover
+        print(
+            f"[Worker GPU {gpu_id}] ERROR: could not import visualise_binder_validation.py "
+            f"from {script_dir} ({exc})"
+        )
+        return
+
+    while True:
+        task = task_queue.get()
+        if task is None:
+            # Sentinel: no more work
+            break
+
+        bname = task.name
+        bseqs = task.seqs
+        bmsas = task.msas
+
+        binder_dir = out_root / f"binder_{bname}"
+        binder_dir.mkdir(parents=True, exist_ok=True)
+
+        print(
+            f"[GPU {gpu_id}] Binder '{bname}': "
+            f"needs_boltz={task.needs_boltz}, needs_ipsae={task.needs_ipsae}, "
+            f"needs_summary_row={task.needs_summary_row}"
+        )
+
+        # 1) Build YAMLs: always redo, they are cheap and idempotent
+        partner_jobs: List[Dict[str, object]] = []
+
+        for partner in partners:
+            role = partner["role"]  # type: ignore[index]
+            pname = partner["name"]  # type: ignore[index]
+            tseqs = partner["seqs"]  # type: ignore[index]
+            tmsas = partner["msas"]  # type: ignore[index]
+
+            yaml_stem = f"binder_{bname}_vs_{role}_{pname}"
+            yaml_path = binder_dir / f"{yaml_stem}.yaml"
+
+            yaml_text = yaml_for_pair(
+                binder_seqs=bseqs,  # type: ignore[arg-type]
+                partner_seqs=tseqs,  # type: ignore[arg-type]
+                partner_role=role,  # type: ignore[arg-type]
+                binder_msas=bmsas,  # type: ignore[arg-type]
+                partner_msas=tmsas,  # type: ignore[arg-type]
+            )
+            yaml_path.write_text(yaml_text, encoding="utf-8")
+
+            partner_jobs.append(
+                {
+                    "role": role,
+                    "partner": pname,
+                    "yaml_path": yaml_path,
+                    "binder_msas": bmsas,
+                    "partner_msas": tmsas,
+                }
+            )
+
+        if getattr(args, "include_self", False):
+            role = "self"
+            pname = "self"
+            tseqs = list(bseqs)
+            tmsas = list(bmsas)
+            yaml_stem = f"binder_{bname}_vs_self"
+            yaml_path = binder_dir / f"{yaml_stem}.yaml"
+
+            yaml_text = yaml_for_pair(
+                binder_seqs=bseqs,  # type: ignore[arg-type]
+                partner_seqs=tseqs,  # type: ignore[arg-type]
+                partner_role=role,
+                binder_msas=bmsas,  # type: ignore[arg-type]
+                partner_msas=tmsas,  # type: ignore[arg-type]
+            )
+            yaml_path.write_text(yaml_text, encoding="utf-8")
+
+            partner_jobs.append(
+                {
+                    "role": role,
+                    "partner": pname,
+                    "yaml_path": yaml_path,
+                    "binder_msas": bmsas,
+                    "partner_msas": tmsas,
+                }
+            )
+
+        # 2) Run Boltz if needed
+        if task.needs_boltz and partner_jobs:
+            print(f"[GPU {gpu_id}]  Running Boltz for {len(partner_jobs)} complex(es) (binder '{bname}').")
+            for jdx, job in enumerate(partner_jobs, start=1):
+                role = job["role"]
+                partner_name = job["partner"]
+                yaml_path = job["yaml_path"]
+                jbmsas = job["binder_msas"]
+                jtmsas = job["partner_msas"]
+
+                out_dir = binder_dir / "outputs"
+                use_msa = decide_use_msa_server(
+                    args.use_msa_server,
+                    binder_msas=jbmsas,  # type: ignore[arg-type]
+                    partner_msas=jtmsas,  # type: ignore[arg-type]
+                )
+
+                print(
+                    f"[GPU {gpu_id}]    [{jdx}/{len(partner_jobs)}] Boltz: binder='{bname}' "
+                    f"vs {role}='{partner_name}'..."
+                )
+
+                cmd = [
+                    sys.executable,
+                    "-m",
+                    "boltz.main",
+                    "predict",
+                    yaml_path.name,
+                    "--out_dir",
+                    str(out_dir),
+                    "--recycling_steps",
+                    str(args.recycling_steps),
+                    "--diffusion_samples",
+                    str(args.diffusion_samples),
+                ]
+                if use_msa:
+                    cmd.append("--use_msa_server")
+
+                log_name = f"boltz_binder_{bname}_vs_{role}_{partner_name}.log"
+                log_path = logs_dir / sanitize_name(log_name)
+
+                returncode = run_subprocess(
+                    cmd=cmd,
+                    cwd=binder_dir,
+                    log_path=log_path,
+                    verbose=args.verbose,
+                )
+                if returncode != 0:
+                    print(
+                        f"[GPU {gpu_id}]      !! Boltz failed for binder='{bname}' "
+                        f"vs {role}='{partner_name}'. See log: {log_path}"
+                    )
+                elif not args.verbose:
+                    print(f"[GPU {gpu_id}]      Done. (log: {log_path})")
+
+        # 3) Run ipSAE if needed
+        if task.needs_ipsae:
+            print(f"[GPU {gpu_id}]  Running ipSAE for binder '{bname}'...")
+            viz.analyse_binder(binder_dir, ipsae_args)
+
+        # 4) Compute summary and send to main if needed
+        if task.needs_summary_row:
+            summary = compute_binder_summary(
+                binder_dir=binder_dir,
+                metric_preference="ipSAE_min",
+            )
+            if summary is not None:
+                summary_queue.put(summary)
+
+    # Signal completion
+    summary_queue.put(None)  # type: ignore[arg-type]
+
 
 def main() -> None:
     args = parse_args()
     script_dir = Path(__file__).resolve().parent
     out_root = Path(args.out_dir).resolve()
-    out_root.mkdir(parents=True, exist_ok=True)
+
+    # Validate resume/overwrite behaviour
+    if args.resume and args.overwrite:
+        raise SystemExit("ERROR: --resume and --overwrite are mutually exclusive.")
+
+    if out_root.exists():
+        if args.overwrite:
+            shutil.rmtree(out_root)
+            out_root.mkdir(parents=True, exist_ok=True)
+        elif not args.resume:
+            raise SystemExit(
+                f"ERROR: Output directory {out_root} already exists. "
+                f"Use --resume to continue or --overwrite to discard previous results."
+            )
+        else:
+            # resume: reuse existing directory
+            out_root.mkdir(parents=True, exist_ok=True)
+    else:
+        # fresh run (resume or not)
+        out_root.mkdir(parents=True, exist_ok=True)
 
     # Make visualise_binder_validation importable
     if str(script_dir) not in sys.path:
@@ -585,13 +1026,9 @@ def main() -> None:
         f"{1 + int(antitarget is not None)} partner type(s) (target / antitarget / self)."
     )
 
-    # ------------------------------------------------------------------
-    # Stage 2: Binder‑by‑binder Boltz + ipSAE
-    # ------------------------------------------------------------------
-    print(
-        f"Stage 2/2: Running Boltz + ipSAE per binder ({len(binders)} total binder(s))..."
-    )
-
+    # ------------------------------------------------------------------------------------------------
+    # Stage 2: Binder‑by‑binder Boltz + ipSAE (sequential or multi‑GPU depending on --gpus)
+    # ------------------------------------------------------------------------------------------------
     logs_dir = out_root / "logs"
     logs_dir.mkdir(parents=True, exist_ok=True)
 
@@ -601,150 +1038,233 @@ def main() -> None:
         ipsae_d=int(args.ipsae_dist_cutoff),
     )
 
-    for idx, binder in enumerate(binders, start=1):
-        bname = binder["name"]  # type: ignore[assignment]
-        bseqs = binder["seqs"]  # type: ignore[assignment]
-        bmsas = binder["msas"]  # type: ignore[assignment]
+    # Build binder tasks according to resume flag
+    binder_tasks = build_binder_tasks(
+        binders=binders,
+        partners=partners,
+        out_root=out_root,
+        include_self=bool(args.include_self),
+        resume=bool(args.resume),
+    )
 
-        binder_dir = out_root / f"binder_{bname}"
-        binder_dir.mkdir(parents=True, exist_ok=True)
-
+    if not binder_tasks:
+        print("No binders require work (Boltz/ipSAE/summary).")
+    else:
         print(
-            f"\nBinder {idx}/{len(binders)}: '{bname}' "
-            f"(chains={len(bseqs)}, partners={1 + int(antitarget is not None) + int(args.include_self)})"
+            f"Stage 2/2: Running Boltz + ipSAE for {len(binder_tasks)} binder(s) "
+            f"(from total {len(binders)})."
         )
 
-        # --------------------------------------------------------------
-        # 2a. Build YAMLs for this binder
-        # --------------------------------------------------------------
-        partner_jobs: List[Dict[str, object]] = []
+    gpu_ids = parse_gpus_arg(args.gpus)
 
-        for partner in partners:
-            role = partner["role"]  # type: ignore[index]
-            pname = partner["name"]  # type: ignore[index]
-            tseqs = partner["seqs"]  # type: ignore[index]
-            tmsas = partner["msas"]  # type: ignore[index]
+    if not binder_tasks:
+        # Nothing to do; still run global plot_overall below
+        pass
+    elif gpu_ids is None or len(binder_tasks) == 1:
+        # Sequential path (single GPU/CPU)
+        completed_binders: set[str] = set()
+        for idx, task in enumerate(binder_tasks, start=1):
+            bname = task.name
+            bseqs = task.seqs
+            bmsas = task.msas
 
-            yaml_stem = f"binder_{bname}_vs_{role}_{pname}"
-            yaml_path = binder_dir / f"{yaml_stem}.yaml"
-
-            yaml_text = yaml_for_pair(
-                binder_seqs=bseqs,  # type: ignore[arg-type]
-                partner_seqs=tseqs,  # type: ignore[arg-type]
-                partner_role=role,  # type: ignore[arg-type]
-                binder_msas=bmsas,  # type: ignore[arg-type]
-                partner_msas=tmsas,  # type: ignore[arg-type]
-            )
-            yaml_path.write_text(yaml_text, encoding="utf-8")
-
-            partner_jobs.append(
-                {
-                    "role": role,
-                    "partner": pname,
-                    "yaml_path": yaml_path,
-                    "binder_msas": bmsas,
-                    "partner_msas": tmsas,
-                }
-            )
-
-        if args.include_self:
-            role = "self"
-            pname = "self"
-            tseqs = list(bseqs)
-            tmsas = list(bmsas)
-            yaml_stem = f"binder_{bname}_vs_self"
-            yaml_path = binder_dir / f"{yaml_stem}.yaml"
-
-            yaml_text = yaml_for_pair(
-                binder_seqs=bseqs,  # type: ignore[arg-type]
-                partner_seqs=tseqs,  # type: ignore[arg-type]
-                partner_role=role,
-                binder_msas=bmsas,  # type: ignore[arg-type]
-                partner_msas=tmsas,  # type: ignore[arg-type]
-            )
-            yaml_path.write_text(yaml_text, encoding="utf-8")
-
-            partner_jobs.append(
-                {
-                    "role": role,
-                    "partner": pname,
-                    "yaml_path": yaml_path,
-                    "binder_msas": bmsas,
-                    "partner_msas": tmsas,
-                }
-            )
-
-        if not partner_jobs:
-            print("  !! No partner jobs created for this binder; skipping.")
-            continue
-
-        # --------------------------------------------------------------
-        # 2b. Run Boltz for this binder vs all partners
-        # --------------------------------------------------------------
-        print(f"  Running Boltz for {len(partner_jobs)} complex(es)...")
-
-        for jdx, job in enumerate(partner_jobs, start=1):
-            role = job["role"]
-            partner_name = job["partner"]
-            yaml_path = job["yaml_path"]
-            bmsas = job["binder_msas"]
-            tmsas = job["partner_msas"]
-
-            out_dir = binder_dir / "outputs"
-            use_msa = decide_use_msa_server(
-                args.use_msa_server,
-                binder_msas=bmsas,  # type: ignore[arg-type]
-                partner_msas=tmsas,  # type: ignore[arg-type]
-            )
+            binder_dir = out_root / f"binder_{bname}"
+            binder_dir.mkdir(parents=True, exist_ok=True)
 
             print(
-                f"    [{jdx}/{len(partner_jobs)}] Boltz: binder='{bname}' "
-                f"vs {role}='{partner_name}'..."
+                f"\nBinder {idx}/{len(binder_tasks)}: '{bname}' "
+                f"(chains={len(bseqs)}, partners={1 + int(antitarget is not None) + int(args.include_self)})"
             )
 
-            cmd = [
-                sys.executable,
-                "-m",
-                "boltz.main",
-                "predict",
-                yaml_path.name,
-                "--out_dir",
-                str(out_dir),
-                "--recycling_steps",
-                str(args.recycling_steps),
-                "--diffusion_samples",
-                str(args.diffusion_samples),
-            ]
-            if use_msa:
-                cmd.append("--use_msa_server")
+            # Build YAMLs for this binder
+            partner_jobs: List[Dict[str, object]] = []
+            for partner in partners:
+                role = partner["role"]  # type: ignore[index]
+                pname = partner["name"]  # type: ignore[index]
+                tseqs = partner["seqs"]  # type: ignore[index]
+                tmsas = partner["msas"]  # type: ignore[index]
 
-            log_name = f"boltz_binder_{bname}_vs_{role}_{partner_name}.log"
-            log_path = logs_dir / sanitize_name(log_name)
+                yaml_stem = f"binder_{bname}_vs_{role}_{pname}"
+                yaml_path = binder_dir / f"{yaml_stem}.yaml"
 
-            returncode = run_subprocess(
-                cmd=cmd,
-                cwd=binder_dir,
-                log_path=log_path,
-                verbose=args.verbose,
-            )
-            if returncode != 0:
-                print(
-                    f"      !! Boltz failed for binder='{bname}' vs {role}='{partner_name}'. "
-                    f"See log: {log_path}"
+                yaml_text = yaml_for_pair(
+                    binder_seqs=bseqs,  # type: ignore[arg-type]
+                    partner_seqs=tseqs,  # type: ignore[arg-type]
+                    partner_role=role,  # type: ignore[arg-type]
+                    binder_msas=bmsas,  # type: ignore[arg-type]
+                    partner_msas=tmsas,  # type: ignore[arg-type]
                 )
-            elif not args.verbose:
-                print(f"      Done. (log: {log_path})")
+                yaml_path.write_text(yaml_text, encoding="utf-8")
 
-        # --------------------------------------------------------------
-        # 2c. Run ipSAE for this binder only
-        # --------------------------------------------------------------
-        print("  Running ipSAE + binder‑level summaries...")
-        viz.analyse_binder(binder_dir, ipsae_args)
-        append_binder_summary(
-            binder_dir=binder_dir,
-            out_root=out_root,
-            metric_preference="ipSAE_min",
-        )
+                partner_jobs.append(
+                    {
+                        "role": role,
+                        "partner": pname,
+                        "yaml_path": yaml_path,
+                        "binder_msas": bmsas,
+                        "partner_msas": tmsas,
+                    }
+                )
+
+            if args.include_self:
+                role = "self"
+                pname = "self"
+                tseqs = list(bseqs)
+                tmsas = list(bmsas)
+                yaml_stem = f"binder_{bname}_vs_self"
+                yaml_path = binder_dir / f"{yaml_stem}.yaml"
+
+                yaml_text = yaml_for_pair(
+                    binder_seqs=bseqs,  # type: ignore[arg-type]
+                    partner_seqs=tseqs,  # type: ignore[arg-type]
+                    partner_role=role,
+                    binder_msas=bmsas,  # type: ignore[arg-type]
+                    partner_msas=tmsas,  # type: ignore[arg-type]
+                )
+                yaml_path.write_text(yaml_text, encoding="utf-8")
+
+                partner_jobs.append(
+                    {
+                        "role": role,
+                        "partner": pname,
+                        "yaml_path": yaml_path,
+                        "binder_msas": bmsas,
+                        "partner_msas": tmsas,
+                    }
+                )
+
+            # Run Boltz if needed
+            if task.needs_boltz and partner_jobs:
+                print(f"  Running Boltz for {len(partner_jobs)} complex(es)...")
+                for jdx, job in enumerate(partner_jobs, start=1):
+                    role = job["role"]
+                    partner_name = job["partner"]
+                    yaml_path = job["yaml_path"]
+                    jbmsas = job["binder_msas"]
+                    jtmsas = job["partner_msas"]
+
+                    out_dir = binder_dir / "outputs"
+                    use_msa = decide_use_msa_server(
+                        args.use_msa_server,
+                        binder_msas=jbmsas,  # type: ignore[arg-type]
+                        partner_msas=jtmsas,  # type: ignore[arg-type]
+                    )
+
+                    print(
+                        f"    [{jdx}/{len(partner_jobs)}] Boltz: binder='{bname}' "
+                        f"vs {role}='{partner_name}'..."
+                    )
+
+                    cmd = [
+                        sys.executable,
+                        "-m",
+                        "boltz.main",
+                        "predict",
+                        yaml_path.name,
+                        "--out_dir",
+                        str(out_dir),
+                        "--recycling_steps",
+                        str(args.recycling_steps),
+                        "--diffusion_samples",
+                        str(args.diffusion_samples),
+                    ]
+                    if use_msa:
+                        cmd.append("--use_msa_server")
+
+                    log_name = f"boltz_binder_{bname}_vs_{role}_{partner_name}.log"
+                    log_path = logs_dir / sanitize_name(log_name)
+
+                    returncode = run_subprocess(
+                        cmd=cmd,
+                        cwd=binder_dir,
+                        log_path=log_path,
+                        verbose=args.verbose,
+                    )
+                    if returncode != 0:
+                        print(
+                            f"      !! Boltz failed for binder='{bname}' vs {role}='{partner_name}'. "
+                            f"See log: {log_path}"
+                        )
+                    elif not args.verbose:
+                        print(f"      Done. (log: {log_path})")
+
+            # Run ipSAE if needed
+            if task.needs_ipsae:
+                print("  Running ipSAE for this binder...")
+                viz.analyse_binder(binder_dir, ipsae_args)
+
+            # Append summary row if needed
+            if task.needs_summary_row:
+                summary = compute_binder_summary(
+                    binder_dir=binder_dir,
+                    metric_preference="ipSAE_min",
+                )
+                if summary is not None:
+                    append_binder_summary_row(
+                        out_root=out_root,
+                        summary=summary,
+                        completed_binders=completed_binders,
+                    )
+    else:
+        # Multi-GPU path
+        print(f"Using GPUs: {gpu_ids}")
+        task_queue: "mp.Queue[Optional[BinderTask]]" = mp.Queue()
+        summary_queue: "mp.Queue[Optional[Tuple[str, str, Optional[float], Optional[float], Optional[float], Optional[float], int, int]]]" = mp.Queue()
+
+        # Enqueue tasks
+        for task in binder_tasks:
+            task_queue.put(task)
+        # Sentinel per worker
+        for _ in gpu_ids:
+            task_queue.put(None)
+
+        # Spawn workers
+        workers: List[mp.Process] = []
+        for gpu_id in gpu_ids:
+            p = mp.Process(
+                target=worker_loop,
+                args=(
+                    gpu_id,
+                    task_queue,
+                    summary_queue,
+                    partners,
+                    out_root,
+                    logs_dir,
+                    ipsae_args,
+                    args,
+                ),
+            )
+            p.start()
+            workers.append(p)
+
+        # Single writer for binder_pair_summary.csv
+        completed_binders: set[str] = set()
+        # Preload any existing rows (resume case)
+        summary_path = out_root / "summary" / "binder_pair_summary.csv"
+        if summary_path.is_file():
+            df_summary = pd.read_csv(summary_path)
+            if "binder_name" in df_summary.columns:
+                completed_binders.update(df_summary["binder_name"].astype(str))
+
+        finished_workers = 0
+        while finished_workers < len(gpu_ids):
+            item = summary_queue.get()
+            if item is None:
+                finished_workers += 1
+                continue
+            binder_name = item[0]
+            if binder_name in completed_binders:
+                # Already have a row; skip
+                continue
+            append_binder_summary_row(
+                out_root=out_root,
+                summary=item,  # type: ignore[arg-type]
+                completed_binders=completed_binders,
+            )
+
+        # Join workers
+        for p in workers:
+            p.join()
 
     # --------------------------------------------------------------
     # Final global summaries / heatmaps (optional but kept)
@@ -768,4 +1288,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-
