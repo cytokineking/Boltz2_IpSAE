@@ -77,7 +77,7 @@ installed in that environment.
 Clone this repository:
 
 ```bash
-git clone https://github.com/profdocpizza/Boltz2_IpSAE.git
+git clone https://github.com/cytokineking/Boltz2_IpSAE
 cd Boltz2_IpSAE
 ```
 
