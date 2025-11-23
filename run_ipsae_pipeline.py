@@ -926,6 +926,8 @@ def main() -> None:
         if args.overwrite:
             shutil.rmtree(out_root)
             out_root.mkdir(parents=True, exist_ok=True)
+            print(f"Using out_dir: {out_root}")
+            print("Mode: overwrite (existing outputs deleted).")
         elif not args.resume:
             raise SystemExit(
                 f"ERROR: Output directory {out_root} already exists. "
@@ -934,9 +936,13 @@ def main() -> None:
         else:
             # resume: reuse existing directory
             out_root.mkdir(parents=True, exist_ok=True)
+            print(f"Using out_dir: {out_root}")
+            print("Mode: resume (reusing existing outputs).")
     else:
         # fresh run (resume or not)
         out_root.mkdir(parents=True, exist_ok=True)
+        print(f"Using out_dir: {out_root}")
+        print("Mode: fresh run.")
 
     # Make visualise_binder_validation importable
     if str(script_dir) not in sys.path:
@@ -1050,10 +1056,12 @@ def main() -> None:
     if not binder_tasks:
         print("No binders require work (Boltz/ipSAE/summary).")
     else:
-        print(
-            f"Stage 2/2: Running Boltz + ipSAE for {len(binder_tasks)} binder(s) "
-            f"(from total {len(binders)})."
-        )
+        pending = len(binder_tasks)
+        completed = len(binders) - pending
+        print(f"\nStage 2/2: Boltz + ipSAE binder processing")
+        print(f"  Total binders defined: {len(binders)}")
+        print(f"  Binders needing work:  {pending}")
+        print(f"  Binders already done:  {completed}")
 
     gpu_ids = parse_gpus_arg(args.gpus)
 
@@ -1207,7 +1215,8 @@ def main() -> None:
                     )
     else:
         # Multi-GPU path
-        print(f"Using GPUs: {gpu_ids}")
+        print(f"\nMulti-GPU mode: {len(gpu_ids)} worker(s) on GPU(s): {gpu_ids}")
+        print(f"  Binder tasks to process: {len(binder_tasks)}")
         task_queue: "mp.Queue[Optional[BinderTask]]" = mp.Queue()
         summary_queue: "mp.Queue[Optional[Tuple[str, str, Optional[float], Optional[float], Optional[float], Optional[float], int, int]]]" = mp.Queue()
 
