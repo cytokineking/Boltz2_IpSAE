@@ -257,7 +257,263 @@ After all binders are processed, it also writes:
 
 ---
 
-## 4. Legacy helpers
+## 4. Modal Cloud Deployment
+
+For serverless GPU execution on Modal's cloud infrastructure, use
+`modal_boltz_ipsae.py`. This provides the same functionality as
+`run_ipsae_pipeline.py` but runs on Modal's cloud GPUs with automatic
+parallel processing.
+
+### 4.1. Setup
+
+Install Modal and authenticate:
+
+```bash
+pip install modal
+modal token new
+```
+
+Initialize the Boltz model cache (run once):
+
+```bash
+modal run modal_boltz_ipsae.py::init_cache
+```
+
+### 4.2. Basic Usage
+
+**Single binder from sequence:**
+
+```bash
+modal run modal_boltz_ipsae.py::run_pipeline \
+  --binder-name "my_binder" \
+  --binder-seq "MKTAYIAKQRQISFVK..." \
+  --target-name nipah_g \
+  --target-fasta example_yaml/nipah_g.fasta \
+  --output-dir ./results
+```
+
+**Multiple binders from CSV:**
+
+```bash
+modal run modal_boltz_ipsae.py::run_pipeline \
+  --binder-csv binders.csv \
+  --binder-name-col binder_name \
+  --binder-seq-col binder_sequence \
+  --target-name nipah_g \
+  --target-fasta example_yaml/nipah_g.fasta \
+  --target-msa example_yaml/nipah.a3m \
+  --output-dir ./results
+```
+
+**Full pipeline with antitarget and self-binding:**
+
+```bash
+modal run modal_boltz_ipsae.py::run_pipeline \
+  --binder-csv binders.csv \
+  --target-name nipah_g \
+  --target-fasta example_yaml/nipah_g.fasta \
+  --target-msa example_yaml/nipah.a3m \
+  --antitarget-name sialidase \
+  --antitarget-fasta example_yaml/sialidase_2F29.fasta \
+  --include-self \
+  --output-dir ./results
+```
+
+### 4.3. CLI Options
+
+The Modal pipeline supports all options from `run_ipsae_pipeline.py`:
+
+**Binder inputs** (choose one):
+
+| Option | Description |
+|--------|-------------|
+| `--binder-csv` | CSV file with binder name and sequence columns |
+| `--binder-fasta` | Single FASTA file with multiple binders |
+| `--binder-fasta-dir` | Directory of FASTA files (one binder per file) |
+| `--binder-name` + `--binder-seq` | Single binder from CLI |
+
+**Binder options:**
+
+| Option | Description |
+|--------|-------------|
+| `--binder-name-col` | Column name for binder names in CSV (default: `name`) |
+| `--binder-seq-col` | Column name for sequences in CSV (default: `sequence`) |
+| `--add-n-terminal-lysine` | Prepend 'K' to each binder chain if missing |
+
+**Target/Antitarget:**
+
+| Option | Description |
+|--------|-------------|
+| `--target-name` | Name of target protein (required) |
+| `--target-fasta` / `--target-seq` | Target sequence (one required) |
+| `--target-msa` | Optional MSA file for target |
+| `--antitarget-name` | Name of off-target protein |
+| `--antitarget-fasta` / `--antitarget-seq` | Antitarget sequence |
+| `--antitarget-msa` | Optional MSA file for antitarget |
+| `--include-self` | Run each binder against itself |
+
+**Boltz parameters:**
+
+| Option | Default | Description |
+|--------|---------|-------------|
+| `--recycling-steps` | 10 | Boltz recycling iterations |
+| `--diffusion-samples` | 5 | Number of structure samples |
+| `--use-msa-server` | auto | MSA server usage (`auto`/`true`/`false`) |
+
+**ipSAE parameters:**
+
+| Option | Default | Description |
+|--------|---------|-------------|
+| `--pae-cutoff` | 15 | PAE cutoff in Å |
+| `--dist-cutoff` | 15 | Distance cutoff in Å |
+
+**GPU and parallelization:**
+
+| Option | Default | Description |
+|--------|---------|-------------|
+| `--gpu` | A100-80GB | GPU type (see table below) |
+| `--max-parallel` | 10 | Max concurrent containers |
+
+**Output:**
+
+| Option | Description |
+|--------|-------------|
+| `--output-dir` | Local directory to save results |
+| `--verbose` | Show detailed Boltz/ipSAE output |
+
+### 4.4. GPU Options
+
+Modal supports various GPU types. **A100-80GB is the default** (good balance of
+cost and performance for protein structure prediction).
+
+| GPU | VRAM | Cost |
+|-----|------|------|
+| `T4` | 16GB | $0.59/h |
+| `L4` | 24GB | $0.80/h |
+| `A10G` | 24GB | $1.10/h |
+| `L40S` | 48GB | $1.95/h |
+| `A100-40GB` | 40GB | $2.10/h |
+| `A100-80GB` | 80GB | **$2.50/h (default)** |
+| `H100` | 80GB | $3.95/h |
+| `H200` | 141GB | $4.54/h |
+| `B200` | 192GB | $6.25/h |
+
+List available GPUs:
+
+```bash
+modal run modal_boltz_ipsae.py::list_gpus
+```
+
+**GPU specification examples:**
+
+```bash
+--gpu H100           # H100 (fast)
+--gpu A100-80GB      # A100 80GB (default)
+--gpu L40S           # L40S (good cost/performance)
+--gpu T4             # T4 (cheapest, for testing)
+```
+
+### 4.5. Parallel Processing
+
+The Modal pipeline automatically processes binders in parallel:
+
+- Each binder runs in its own container with dedicated GPU
+- `--max-parallel` controls maximum concurrent containers
+- Failures are handled gracefully (other binders continue)
+
+Example with 8 parallel B200 GPUs:
+
+```bash
+modal run modal_boltz_ipsae.py::run_pipeline \
+  --binder-csv binders.csv \
+  --target-fasta target.fasta \
+  --gpu B200 \
+  --max-parallel 8 \
+  --output-dir ./results
+```
+
+### 4.6. Output Format
+
+The Modal pipeline produces output identical to `run_ipsae_pipeline.py`:
+
+```
+output_dir/
+├── binder_pair_summary.csv          # Summary CSV (harmonized format)
+├── binder_MyBinder1/
+│   ├── metrics.json                 # Detailed metrics for all partners
+│   ├── structures_target/           # CIF files for target predictions
+│   │   ├── MyBinder1_vs_target_model_0.cif
+│   │   ├── MyBinder1_vs_target_model_1.cif
+│   │   └── ...
+│   ├── structures_antitarget/       # CIF files for antitarget (if used)
+│   └── structures_self/             # CIF files for self-binding (if used)
+├── binder_MyBinder2/
+│   └── ...
+```
+
+**Summary CSV columns** (matches `run_ipsae_pipeline.py`):
+
+```
+binder_name, n_target_models, n_antitarget_models, n_self_models,
+target_ipSAE_mean, target_ipSAE_std, target_ipSAE_min_mean, ...,
+target_ipTM_af_mean, target_ipTM_af_std, target_pDockQ2_mean, ...,
+antitarget_ipSAE_mean, antitarget_ipSAE_std, ...,
+self_ipSAE_mean, self_ipSAE_std, ...
+```
+
+### 4.7. Utility Commands
+
+**Test Modal connection:**
+
+```bash
+modal run modal_boltz_ipsae.py::test_connection
+```
+
+**Convert FASTA to CSV:**
+
+```bash
+modal run modal_boltz_ipsae.py::convert_fasta_to_csv --fasta-file binders.fasta
+```
+
+### 4.8. Example: Nipah G with Known Binders
+
+Run the bundled Nipah example on Modal with parallel processing:
+
+```bash
+modal run modal_boltz_ipsae.py::run_pipeline \
+  --binder-fasta-dir example_yaml/known_binders \
+  --target-name nipah_g \
+  --target-fasta example_yaml/nipah_g.fasta \
+  --target-msa example_yaml/nipah.a3m \
+  --antitarget-name sialidase \
+  --antitarget-fasta example_yaml/sialidase_2F29.fasta \
+  --include-self \
+  --gpu H100 \
+  --max-parallel 8 \
+  --output-dir ./nipah_modal_results
+```
+
+---
+
+## 5. Output Metrics
+
+The pipeline now reports comprehensive metrics for each binder-target pair:
+
+| Metric | Description | Use Case |
+|--------|-------------|----------|
+| **`ipSAE`** | Primary metric from `max` row (best direction) | **Primary ranking metric** |
+| **`ipSAE_min`** | Minimum across asymmetric directions | Conservative filtering |
+| **`ipSAE_max`** | Maximum across asymmetric directions | Optimistic estimate |
+| **`ipTM_af`** | Native Boltz/AlphaFold interface confidence | Cross-validation |
+| **`pDockQ2`** | Alternative interface score (Elofsson lab) | Additional validation |
+| **`ipSAE_d0chn`** | ipSAE with d0 = sum of chain lengths | Alternative variant |
+| **`ipSAE_d0dom`** | ipSAE with d0 = interface residue count | Alternative variant |
+
+For each metric, the pipeline reports mean ± std across all models (typically 5).
+
+---
+
+## 6. Legacy helpers
 
 The older `make_binder_validation_scripts.py` + `run_all_cofolding.sh` +
 `visualise_binder_validation.py` workflow is still present for compatibility,
