@@ -457,13 +457,17 @@ def run_subprocess(
 
 
 def compute_binder_summary(
-    binder_dir: Path, metric_preference: str = "ipSAE_min"
-) -> Optional[Tuple[str, str, Optional[float], Optional[float], Optional[float], Optional[float], int, int]]:
+    binder_dir: Path, metric_preference: str = "ipSAE"
+) -> Optional[Dict[str, object]]:
     """
-    Read binder_*/plots/ipsae_summary.csv, compute mean/std of selected metric
-    for target and antitarget, and return a summary tuple:
+    Read binder_*/plots/ipsae_summary.csv, compute mean/std of all key metrics
+    for target and antitarget, and return a comprehensive summary dict.
 
-        (binder_name, metric_col, tgt_mean, tgt_std, at_mean, at_std, tgt_n, at_n)
+    Key metrics reported:
+    - ipSAE (primary, from max row)
+    - ipSAE_min, ipSAE_max (from asym rows)
+    - ipTM_af (AlphaFold/Boltz ipTM)
+    - pDockQ2
 
     Returns None if no suitable data is found.
     """
@@ -479,118 +483,143 @@ def compute_binder_summary(
     if "target_type" not in df.columns and "vs" in df.columns:
         df["target_type"] = "unknown"
 
-    # Choose metric column
-    preferred = [metric_preference, "ipSAE_min", "ipSAE_max", "ipSAE"]
-    metric_col = next((m for m in preferred if m in df.columns), None)
-    if metric_col is None:
-        print(f"    !! No ipSAE metric columns found in {csv_path}; skipping summary row.")
+    # Define key metrics to summarize (in order of importance)
+    key_metrics = ["ipSAE", "ipSAE_min", "ipSAE_max", "ipTM_af", "pDockQ2"]
+    available_metrics = [m for m in key_metrics if m in df.columns]
+
+    if not available_metrics:
+        print(f"    !! No key metrics found in {csv_path}; skipping summary row.")
         return None
 
     binder_short = binder_dir.name.replace("binder_", "", 1)
 
-    def stats_for_type(tt: str) -> tuple[Optional[float], Optional[float], int]:
+    def stats_for_type(tt: str, metrics: List[str]) -> Dict[str, object]:
         sub = df[df["target_type"] == tt]
         n = len(sub)
-        if n == 0:
-            return None, None, 0
-        mean = float(sub[metric_col].mean())
-        std = float(sub[metric_col].std(ddof=1)) if n > 1 else 0.0
-        return mean, std, n
+        result = {"n": n}
+        for metric in metrics:
+            if metric not in sub.columns:
+                result[f"{metric}_mean"] = None
+                result[f"{metric}_std"] = None
+                continue
+            if n == 0:
+                result[f"{metric}_mean"] = None
+                result[f"{metric}_std"] = None
+            else:
+                result[f"{metric}_mean"] = float(sub[metric].mean())
+                result[f"{metric}_std"] = float(sub[metric].std(ddof=1)) if n > 1 else 0.0
+        return result
 
-    tgt_mean, tgt_std, tgt_n = stats_for_type("target")
-    at_mean, at_std, at_n = stats_for_type("antitarget")
+    tgt_stats = stats_for_type("target", available_metrics)
+    at_stats = stats_for_type("antitarget", available_metrics)
+    self_stats = stats_for_type("self", available_metrics)
 
-    return (
-        binder_short,
-        metric_col,
-        tgt_mean,
-        tgt_std,
-        at_mean,
-        at_std,
-        tgt_n,
-        at_n,
-    )
+    # Build comprehensive summary dict
+    summary = {
+        "binder_name": binder_short,
+        "n_target_models": tgt_stats["n"],
+        "n_antitarget_models": at_stats["n"],
+        "n_self_models": self_stats["n"],
+    }
+
+    # Add target metrics
+    for metric in available_metrics:
+        summary[f"target_{metric}_mean"] = tgt_stats.get(f"{metric}_mean")
+        summary[f"target_{metric}_std"] = tgt_stats.get(f"{metric}_std")
+
+    # Add antitarget metrics
+    for metric in available_metrics:
+        summary[f"antitarget_{metric}_mean"] = at_stats.get(f"{metric}_mean")
+        summary[f"antitarget_{metric}_std"] = at_stats.get(f"{metric}_std")
+
+    # Add self metrics
+    for metric in available_metrics:
+        summary[f"self_{metric}_mean"] = self_stats.get(f"{metric}_mean")
+        summary[f"self_{metric}_std"] = self_stats.get(f"{metric}_std")
+
+    return summary
 
 
 def append_binder_summary_row(
     out_root: Path,
-    summary: Tuple[
-        str,
-        str,
-        Optional[float],
-        Optional[float],
-        Optional[float],
-        Optional[float],
-        int,
-        int,
-    ],
+    summary: Dict[str, object],
     completed_binders: Optional[set[str]] = None,
     print_to_console: bool = True,
 ) -> None:
     """
-    Append a one-row summary to out_root/summary/binder_pair_summary.csv.
-    summary is the tuple returned by compute_binder_summary.
+    Append a comprehensive summary row to out_root/summary/binder_pair_summary.csv.
+    summary is the dict returned by compute_binder_summary.
     completed_binders, if provided, is updated with binder_name.
     """
-    (
-        binder_short,
-        metric_col,
-        tgt_mean,
-        tgt_std,
-        at_mean,
-        at_std,
-        tgt_n,
-        at_n,
-    ) = summary
+    binder_short = summary["binder_name"]
+    tgt_n = summary.get("n_target_models", 0)
+    at_n = summary.get("n_antitarget_models", 0)
 
-    # Print to console
-    if tgt_n > 0:
-        print(
-            f"    Binder '{binder_short}': target {metric_col} "
-            f"mean={tgt_mean:.3f}, std={tgt_std:.3f} (n={tgt_n})"
-        )
-    else:
-        print(f"    Binder '{binder_short}': no target rows found in ipsae_summary.csv")
+    # Print to console - show key metrics
+    if print_to_console:
+        if tgt_n > 0:
+            ipSAE_mean = summary.get("target_ipSAE_mean")
+            ipSAE_std = summary.get("target_ipSAE_std", 0)
+            ipTM_mean = summary.get("target_ipTM_af_mean")
+            if ipSAE_mean is not None:
+                print(
+                    f"    Binder '{binder_short}': target ipSAE "
+                    f"mean={ipSAE_mean:.3f}, std={ipSAE_std:.3f} (n={tgt_n})"
+                )
+                if ipTM_mean is not None:
+                    print(f"                             target ipTM_af mean={ipTM_mean:.3f}")
+        else:
+            print(f"    Binder '{binder_short}': no target rows found in ipsae_summary.csv")
 
-    if at_n > 0:
-        print(
-            f"                             antitarget {metric_col} "
-            f"mean={at_mean:.3f}, std={at_std:.3f} (n={at_n})"
-        )
+        if at_n > 0:
+            at_ipSAE_mean = summary.get("antitarget_ipSAE_mean")
+            at_ipSAE_std = summary.get("antitarget_ipSAE_std", 0)
+            if at_ipSAE_mean is not None:
+                print(
+                    f"                             antitarget ipSAE "
+                    f"mean={at_ipSAE_mean:.3f}, std={at_ipSAE_std:.3f} (n={at_n})"
+                )
 
     # Append to global summary CSV
     summary_dir = out_root / "summary"
     summary_dir.mkdir(parents=True, exist_ok=True)
     summary_path = summary_dir / "binder_pair_summary.csv"
 
+    # Define comprehensive header
+    header = [
+        "binder_name",
+        "n_target_models",
+        "n_antitarget_models",
+        "n_self_models",
+        # Target metrics
+        "target_ipSAE_mean", "target_ipSAE_std",
+        "target_ipSAE_min_mean", "target_ipSAE_min_std",
+        "target_ipSAE_max_mean", "target_ipSAE_max_std",
+        "target_ipTM_af_mean", "target_ipTM_af_std",
+        "target_pDockQ2_mean", "target_pDockQ2_std",
+        # Antitarget metrics
+        "antitarget_ipSAE_mean", "antitarget_ipSAE_std",
+        "antitarget_ipSAE_min_mean", "antitarget_ipSAE_min_std",
+        "antitarget_ipSAE_max_mean", "antitarget_ipSAE_max_std",
+        "antitarget_ipTM_af_mean", "antitarget_ipTM_af_std",
+        "antitarget_pDockQ2_mean", "antitarget_pDockQ2_std",
+        # Self metrics
+        "self_ipSAE_mean", "self_ipSAE_std",
+        "self_ipSAE_min_mean", "self_ipSAE_min_std",
+        "self_ipSAE_max_mean", "self_ipSAE_max_std",
+        "self_ipTM_af_mean", "self_ipTM_af_std",
+        "self_pDockQ2_mean", "self_pDockQ2_std",
+    ]
+
     new_file = not summary_path.is_file()
     with summary_path.open("a", newline="", encoding="utf-8") as fh:
         writer = csv.writer(fh)
         if new_file:
-            writer.writerow(
-                [
-                    "binder_name",
-                    "metric",
-                    "target_ipSAE_mean",
-                    "target_ipSAE_std",
-                    "antitarget_ipSAE_mean",
-                    "antitarget_ipSAE_std",
-                    "n_target_models",
-                    "n_antitarget_models",
-                ]
-            )
-        writer.writerow(
-            [
-                binder_short,
-                metric_col,
-                tgt_mean,
-                tgt_std,
-                at_mean,
-                at_std,
-                tgt_n,
-                at_n,
-            ]
-        )
+            writer.writerow(header)
+
+        # Build row from summary dict
+        row = [summary.get(col) for col in header]
+        writer.writerow(row)
 
     if completed_binders is not None:
         completed_binders.add(binder_short)
@@ -763,7 +792,7 @@ def parse_gpus_arg(gpus_arg: Optional[str]) -> Optional[List[int]]:
 def worker_loop(
     gpu_id: int,
     task_queue: "mp.Queue[Optional[BinderTask]]",
-    summary_queue: "mp.Queue[Tuple[str, str, Optional[float], Optional[float], Optional[float], Optional[float], int, int]]",
+    summary_queue: "mp.Queue[Optional[Dict[str, object]]]",
     partners: List[Dict[str, object]],
     out_root: Path,
     logs_dir: Path,
@@ -930,7 +959,7 @@ def worker_loop(
         if task.needs_summary_row:
             summary = compute_binder_summary(
                 binder_dir=binder_dir,
-                metric_preference="ipSAE_min",
+                metric_preference="ipSAE",
             )
             if summary is not None:
                 summary_queue.put(summary)
@@ -1231,7 +1260,7 @@ def main() -> None:
             if task.needs_summary_row:
                 summary = compute_binder_summary(
                     binder_dir=binder_dir,
-                    metric_preference="ipSAE_min",
+                    metric_preference="ipSAE",
                 )
                 if summary is not None:
                     append_binder_summary_row(
@@ -1244,7 +1273,7 @@ def main() -> None:
         print(f"\nMulti-GPU mode: {len(gpu_ids)} worker(s) on GPU(s): {gpu_ids}")
         print(f"  Binder tasks to process: {len(binder_tasks)}")
         task_queue: "mp.Queue[Optional[BinderTask]]" = mp.Queue()
-        summary_queue: "mp.Queue[Optional[Tuple[str, str, Optional[float], Optional[float], Optional[float], Optional[float], int, int]]]" = mp.Queue()
+        summary_queue: "mp.Queue[Optional[Dict[str, object]]]" = mp.Queue()
 
         # Enqueue tasks
         for task in binder_tasks:
@@ -1287,13 +1316,13 @@ def main() -> None:
             if item is None:
                 finished_workers += 1
                 continue
-            binder_name = item[0]
+            binder_name = item.get("binder_name", "")
             if binder_name in completed_binders:
                 # Already have a row; skip
                 continue
             append_binder_summary_row(
                 out_root=out_root,
-                summary=item,  # type: ignore[arg-type]
+                summary=item,
                 completed_binders=completed_binders,
             )
 

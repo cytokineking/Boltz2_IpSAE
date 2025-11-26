@@ -72,11 +72,17 @@ def run_ipsae(
     chain_of_focus="A"
 ):
     """
-    Run ipsae.py and compute min/max metrics for chain_of_focus.
+    Run ipsae.py and extract comprehensive metrics for chain_of_focus.
 
-    If multiple partner chains exist, choose the one with the highest ipSAE_max
-    (using only ASYM rows). Then compute metric_min / metric_max from only
-    those rows.
+    Extracts from both 'asym' and 'max' rows:
+    - ipSAE (primary metric from max row)
+    - ipSAE_min, ipSAE_max (from asym rows)
+    - ipTM (ipTM_af from max row)
+    - pDockQ2 (from max row)
+    - ipSAE_d0chn, ipSAE_d0dom (alternative ipSAE variants)
+
+    If multiple partner chains exist, choose the one with the highest ipSAE
+    from the max row.
     """
 
     import pandas as pd
@@ -100,9 +106,6 @@ def run_ipsae(
     if not os.path.exists(out_txt):
         raise FileNotFoundError(f"Missing ipSAE output: {out_txt}.\nCommand was: {' '.join(cmd)}")
 
-    # ---------------------------
-    # Load table
-
     # ---------------------------------------------------
     # Convert fixed-width text to CSV by collapsing spaces
     # ---------------------------------------------------
@@ -112,103 +115,137 @@ def run_ipsae(
     clean_lines = []
     for line in raw_lines:
         stripped = line.strip()
-
-        # Skip fully blank lines
         if not stripped:
             continue
-
-        # Replace 2+ spaces with a single comma
         cleaned = re.sub(r"\s+", ",", stripped)
-
         clean_lines.append(cleaned)
 
     csv_tmp = out_txt + ".csv"
-
-    # Write cleaned CSV
     with open(csv_tmp, "w") as f:
         for cl in clean_lines:
             f.write(cl + "\n")
 
     # Load CSV normally
-    df = pd.read_csv(csv_tmp)
-        
-
-    df["Type"] = df["Type"].astype(str).str.lower().str.strip()
-    df = df[df["Type"].str.contains("asym", na=False)]
+    df_full = pd.read_csv(csv_tmp)
+    df_full["Type"] = df_full["Type"].astype(str).str.lower().str.strip()
 
     # Required columns
     chn1_col = "Chn1"
     chn2_col = "Chn2"
 
     # Compute category for each chain
-    df["cat1"] = df[chn1_col].apply(classify)
-    df["cat2"] = df[chn2_col].apply(classify)
+    df_full["cat1"] = df_full[chn1_col].apply(classify)
+    df_full["cat2"] = df_full[chn2_col].apply(classify)
 
-    # Keep only binder–target or binder–antitarget pairs
-    df = df[
-        ((df["cat1"] == "binder") & (df["cat2"].isin(["target", "antitarget","self"]))) |
-        ((df["cat2"] == "binder") & (df["cat1"].isin(["target", "antitarget","self"])))
+    # Keep only binder–target/antitarget/self pairs
+    df_full = df_full[
+        ((df_full["cat1"] == "binder") & (df_full["cat2"].isin(["target", "antitarget", "self"]))) |
+        ((df_full["cat2"] == "binder") & (df_full["cat1"].isin(["target", "antitarget", "self"])))
     ]
 
-    if df.empty:
-        raise ValueError(f"No valid binder–target/antitarget ASYM rows for chain {chain_of_focus}")
+    if df_full.empty:
+        raise ValueError(f"No valid binder–target/antitarget rows for chain {chain_of_focus}")
 
-
-
-    # ---------------------------
     # Keep only rows where focus chain appears
-    # ---------------------------
-    df = df[(df[chn1_col] == chain_of_focus) | (df[chn2_col] == chain_of_focus)]
-    if df.empty:
-        raise ValueError(f"No ASYM rows involving chain {chain_of_focus}")
+    df_full = df_full[(df_full[chn1_col] == chain_of_focus) | (df_full[chn2_col] == chain_of_focus)]
+    if df_full.empty:
+        raise ValueError(f"No rows involving chain {chain_of_focus}")
+
+    # Split into asym and max rows
+    df_asym = df_full[df_full["Type"] == "asym"].copy()
+    df_max = df_full[df_full["Type"] == "max"].copy()
 
     # ---------------------------
-    # Identify partner chains
+    # Identify partner chains and select best partner
     # ---------------------------
     partners = set()
-    for _, row in df.iterrows():
+    for _, row in df_full.iterrows():
         partner = row[chn2_col] if row[chn1_col] == chain_of_focus else row[chn1_col]
         partners.add(partner)
     partners = sorted(partners)
 
-    # ---------------------------
-    # If multiple partners → choose highest ipSAE_max partner
-    # ---------------------------
+    # Choose partner with highest ipSAE from max row (or asym if no max rows)
     partner_best = None
     partner_best_score = -np.inf
-    best_df = None
+    best_asym_df = None
+    best_max_df = None
 
     for p in partners:
-        sub = df[
-            ((df[chn1_col] == chain_of_focus) & (df[chn2_col] == p)) |
-            ((df[chn2_col] == chain_of_focus) & (df[chn1_col] == p))
+        # Get asym rows for this partner
+        asym_sub = df_asym[
+            ((df_asym[chn1_col] == chain_of_focus) & (df_asym[chn2_col] == p)) |
+            ((df_asym[chn2_col] == chain_of_focus) & (df_asym[chn1_col] == p))
         ]
-        if sub.empty:
+        # Get max rows for this partner
+        max_sub = df_max[
+            ((df_max[chn1_col] == chain_of_focus) & (df_max[chn2_col] == p)) |
+            ((df_max[chn2_col] == chain_of_focus) & (df_max[chn1_col] == p)) |
+            ((df_max[chn1_col] == p) & (df_max[chn2_col] == chain_of_focus)) |
+            ((df_max[chn2_col] == p) & (df_max[chn1_col] == chain_of_focus))
+        ]
+
+        # Determine score for this partner (prefer max row, fallback to asym)
+        if not max_sub.empty and "ipSAE" in max_sub.columns:
+            score = max_sub["ipSAE"].max()
+        elif not asym_sub.empty and "ipSAE" in asym_sub.columns:
+            score = asym_sub["ipSAE"].max()
+        else:
             continue
 
-        ipSAE_max = sub["ipSAE"].max()
-        if ipSAE_max > partner_best_score:
-            partner_best_score = ipSAE_max
+        if score > partner_best_score:
+            partner_best_score = score
             partner_best = p
-            best_df = sub.copy()
+            best_asym_df = asym_sub.copy() if not asym_sub.empty else None
+            best_max_df = max_sub.copy() if not max_sub.empty else None
 
-    if partner_best is None or best_df is None:
+    if partner_best is None:
         raise ValueError(f"No valid partner rows found for {chain_of_focus}")
 
     # ---------------------------
-    # Compute min/max metrics from best partner rows only
+    # Extract comprehensive metrics
     # ---------------------------
-    numeric_cols = best_df.select_dtypes(include=[np.number]).columns.tolist()
-    numeric_cols = [c for c in numeric_cols if c.lower() != "model"]
-
     output = {
         "chain_of_focus": chain_of_focus,
         "involved_chains": partner_best
     }
 
-    for col in numeric_cols:
-        output[f"{col}_min"] = best_df[col].min()
-        output[f"{col}_max"] = best_df[col].max()
+    # Key metrics to extract (in order of importance)
+    key_metrics = ["ipSAE", "ipSAE_d0chn", "ipSAE_d0dom", "ipTM_af", "ipTM_d0chn", "pDockQ", "pDockQ2", "LIS"]
+
+    # From MAX row: get the primary/best values
+    if best_max_df is not None and not best_max_df.empty:
+        max_row = best_max_df.iloc[0]  # Should be only one max row per partner pair
+        for metric in key_metrics:
+            if metric in max_row.index:
+                try:
+                    output[metric] = float(max_row[metric])
+                except (ValueError, TypeError):
+                    pass
+
+    # From ASYM rows: get min/max across both directions
+    if best_asym_df is not None and not best_asym_df.empty:
+        for metric in key_metrics:
+            if metric in best_asym_df.columns:
+                try:
+                    output[f"{metric}_min"] = float(best_asym_df[metric].min())
+                    output[f"{metric}_max"] = float(best_asym_df[metric].max())
+                except (ValueError, TypeError):
+                    pass
+
+    # If no max row exists, use asym max as the primary ipSAE
+    if "ipSAE" not in output and "ipSAE_max" in output:
+        output["ipSAE"] = output["ipSAE_max"]
+
+    # Also extract n0res, n0chn, n0dom for context (from max row if available)
+    context_cols = ["n0res", "n0chn", "n0dom", "d0res", "d0chn", "d0dom", "nres1", "nres2"]
+    if best_max_df is not None and not best_max_df.empty:
+        max_row = best_max_df.iloc[0]
+        for col in context_cols:
+            if col in max_row.index:
+                try:
+                    output[col] = float(max_row[col])
+                except (ValueError, TypeError):
+                    pass
 
     return output
 
@@ -235,9 +272,16 @@ def parse_vs_name(vs_name: str):
 
 
 
-def analyse_binder(binder_dir: Path ,args):
+def analyse_binder(binder_dir: Path, args):
     """
     Analyse a binder directory: compute ipSAE for all vs_* pairs, save plots.
+
+    Now extracts comprehensive metrics:
+    - ipSAE (primary, from max row)
+    - ipSAE_min, ipSAE_max (from asym rows)
+    - ipTM_af (AlphaFold/Boltz ipTM)
+    - pDockQ2
+    - And more context metrics
     """
     plots_dir = binder_dir / "plots"
     plots_dir.mkdir(exist_ok=True)
@@ -260,10 +304,17 @@ def analyse_binder(binder_dir: Path ,args):
                 continue
 
             try:
-                rec = run_ipsae(pae_file, cif_file, chain_of_focus="A",pae_cutoff=int(args.ipsae_e), dist_cutoff=int(args.ipsae_d))
+                rec = run_ipsae(
+                    pae_file,
+                    cif_file,
+                    chain_of_focus="A",
+                    pae_cutoff=int(args.ipsae_e),
+                    dist_cutoff=int(args.ipsae_d)
+                )
             except Exception as e:
-                print(f"⚠️ ipSAE failed for {pae_file} ({e}). Skipping.")
+                print(f"ipSAE failed for {pae_file} ({e}). Skipping.")
                 continue
+
             # -----------------------------------------------------------
             # Add sequences from YAML (binder1, binder2, target1, ...)
             # -----------------------------------------------------------
@@ -285,8 +336,6 @@ def analyse_binder(binder_dir: Path ,args):
             else:
                 rec["target_sequence"] = ":".join(partner_list)
 
-
-
             rec.update({
                 "binder": binder_dir.name,
                 "vs": vs_name,
@@ -302,13 +351,38 @@ def analyse_binder(binder_dir: Path ,args):
 
     df = pd.DataFrame(binder_records)
 
+    # Reorder columns for clarity: identifiers first, then key metrics, then context
+    id_cols = ["binder", "vs", "partner", "target_type", "model_idx"]
+    key_metric_cols = [
+        "ipSAE", "ipSAE_min", "ipSAE_max",
+        "ipTM_af", "ipTM_af_min", "ipTM_af_max",
+        "pDockQ2", "pDockQ2_min", "pDockQ2_max",
+        "ipSAE_d0chn", "ipSAE_d0dom",
+        "pDockQ", "LIS"
+    ]
+    seq_cols = ["binder_sequence", "target_sequence"]
+    context_cols = ["chain_of_focus", "involved_chains", "n0res", "n0chn", "n0dom"]
+
+    # Build ordered column list (only include columns that exist)
+    ordered_cols = []
+    for col in id_cols + key_metric_cols + seq_cols + context_cols:
+        if col in df.columns:
+            ordered_cols.append(col)
+    # Add any remaining columns not in our predefined list
+    for col in df.columns:
+        if col not in ordered_cols:
+            ordered_cols.append(col)
+
+    df = df[ordered_cols]
+
     csv_path = plots_dir / "ipsae_summary.csv"
     df.to_csv(csv_path, index=False)
 
-    metrics = ["ipSAE_min", "ipSAE_max"]
+    # Generate stripplots for key metrics
+    plot_metrics = ["ipSAE", "ipSAE_min", "ipSAE_max", "ipTM_af", "pDockQ2"]
     partner_order = sorted(df["partner"].dropna().unique().tolist())
 
-    for metric in metrics:
+    for metric in plot_metrics:
         if metric not in df.columns:
             continue
         plt.figure(figsize=(6, 3.5))
@@ -334,7 +408,7 @@ def analyse_binder(binder_dir: Path ,args):
                 title="model_idx",
                 loc="best",
             )
-            
+
         plt.tight_layout()
         for ext in ["png"]:
             plt.savefig(plots_dir / f"{metric}_stripplot.{ext}", dpi=200)
@@ -379,10 +453,15 @@ def extract_sequences_from_yaml(yaml_path):
 
 def plot_overall(root_dir: Path, use_best_model: bool = False):
     """
-    Combine all per-binder CSVs and plot heatmaps for ipSAE_min and ipSAE_max.
+    Combine all per-binder CSVs and plot heatmaps for multiple metrics.
 
-    All targets & antitargets are pooled together; target_type is kept in the
-    DataFrame but not used to split the plots (for now).
+    Now generates heatmaps for:
+    - ipSAE (primary metric from max row)
+    - ipSAE_min, ipSAE_max (from asym rows)
+    - ipTM_af (AlphaFold/Boltz ipTM)
+    - pDockQ2
+
+    Also generates a comprehensive summary CSV with mean/std for all metrics.
     """
     csvs = list(root_dir.glob("binder_*/plots/ipsae_summary.csv"))
     if not csvs:
@@ -390,8 +469,8 @@ def plot_overall(root_dir: Path, use_best_model: bool = False):
         return
 
     dfs = []
-    for csv in csvs:
-        df = pd.read_csv(csv)
+    for csv_file in csvs:
+        df = pd.read_csv(csv_file)
 
         # Backwards compatibility: older CSVs may not have 'partner' or 'target_type'
         if "partner" not in df.columns and "vs" in df.columns:
@@ -405,71 +484,116 @@ def plot_overall(root_dir: Path, use_best_model: bool = False):
     all_df = pd.concat(dfs, ignore_index=True)
     binder_sequences = all_df.groupby("binder_short")["binder_sequence"].first().to_dict()
 
-
     # Add the binder_sequence column
     all_df["binder_sequence"] = all_df["binder_short"].map(binder_sequences)
 
-    metrics = [m for m in ["ipSAE_min"] if m in all_df.columns]
-    if not metrics:
-        print("No ipSAE_min/ipSAE_max metrics found for heatmap plotting.")
+    # Define metrics to process (in order of importance)
+    # Primary metrics for heatmaps
+    heatmap_metrics = ["ipSAE", "ipSAE_min", "ipSAE_max", "ipTM_af", "pDockQ2"]
+    # All metrics for summary statistics
+    all_metrics = [
+        "ipSAE", "ipSAE_min", "ipSAE_max",
+        "ipSAE_d0chn", "ipSAE_d0dom",
+        "ipTM_af", "ipTM_af_min", "ipTM_af_max",
+        "pDockQ", "pDockQ2", "pDockQ2_min", "pDockQ2_max",
+        "LIS"
+    ]
+
+    # Filter to metrics that actually exist in the data
+    available_heatmap_metrics = [m for m in heatmap_metrics if m in all_df.columns]
+    available_all_metrics = [m for m in all_metrics if m in all_df.columns]
+
+    if not available_heatmap_metrics:
+        print("No metrics found for heatmap plotting.")
         return
-    
-    # save all_df for reference
-    # make dir summary
-    Path.mkdir(root_dir/ "summary" ,exist_ok=True)
-    all_df_path = root_dir/ "summary" / "ipsae_summary_all_binders.csv"
+
+    # Create summary directory
+    summary_dir = root_dir / "summary"
+    summary_dir.mkdir(exist_ok=True)
+
+    # Save combined raw data
+    all_df_path = summary_dir / "ipsae_summary_all_binders.csv"
     all_df.to_csv(all_df_path, index=False)
     print(f"Saved combined ipSAE data at {all_df_path}")
 
     # ------------------------------------------------------
     # AGGREGATION ACROSS MODELS
     # ------------------------------------------------------
-    if use_best_model and "ipSAE_min" in all_df.columns:
-        # pick the row (i.e. model) with lowest ipSAE_min per binder/partner
-        idx = all_df.groupby(["binder_short", "partner"])["ipSAE_min"].idxmax()
-        agg_base = all_df.loc[idx].copy()   # still has target_type
+    # Determine primary metric for ordering (prefer ipSAE, fallback to ipSAE_max)
+    primary_metric = "ipSAE" if "ipSAE" in all_df.columns else "ipSAE_max" if "ipSAE_max" in all_df.columns else available_heatmap_metrics[0]
+
+    if use_best_model and primary_metric in all_df.columns:
+        # Pick the row (model) with highest primary metric per binder/partner
+        idx = all_df.groupby(["binder_short", "partner"])[primary_metric].idxmax()
+        agg_base = all_df.loc[idx].copy()
     else:
-        # use all rows as base for ordering & averaging
         agg_base = all_df.copy()
 
+    # Compute mean across models for all available metrics
+    agg = agg_base.groupby(["binder_short", "partner"])[available_heatmap_metrics].mean().reset_index()
 
+    # Also compute std for comprehensive summary
+    agg_std = agg_base.groupby(["binder_short", "partner"])[available_all_metrics].std().reset_index()
+    agg_std.columns = ["binder_short", "partner"] + [f"{m}_std" for m in available_all_metrics]
 
-    # This is what we actually plot (average across models or best-model rows)
-    agg = agg_base.groupby(["binder_short", "partner"])[metrics].mean().reset_index()
+    agg_mean = agg_base.groupby(["binder_short", "partner"])[available_all_metrics].mean().reset_index()
+    agg_mean.columns = ["binder_short", "partner"] + [f"{m}_mean" for m in available_all_metrics]
+
+    agg_count = agg_base.groupby(["binder_short", "partner"]).size().reset_index(name="n_models")
+
+    # Merge mean, std, and count
+    agg_full = agg_mean.merge(agg_std, on=["binder_short", "partner"])
+    agg_full = agg_full.merge(agg_count, on=["binder_short", "partner"])
+
+    # Add target_type back
+    type_map = agg_base.groupby("partner")["target_type"].first().to_dict()
+    agg_full["target_type"] = agg_full["partner"].map(type_map)
+
+    # Add binder_sequence
+    agg_full["binder_sequence"] = agg_full["binder_short"].map(binder_sequences)
+
+    # Reorder columns for clarity
+    id_cols = ["binder_short", "binder_sequence", "partner", "target_type", "n_models"]
+    metric_cols = []
+    for m in available_all_metrics:
+        if f"{m}_mean" in agg_full.columns:
+            metric_cols.append(f"{m}_mean")
+        if f"{m}_std" in agg_full.columns:
+            metric_cols.append(f"{m}_std")
+
+    ordered_cols = id_cols + metric_cols
+    ordered_cols = [c for c in ordered_cols if c in agg_full.columns]
+    agg_full = agg_full[ordered_cols]
+
+    # Save comprehensive summary
+    summary_csv_path = summary_dir / "ipsae_comprehensive_summary.csv"
+    agg_full.to_csv(summary_csv_path, index=False, float_format="%.6f")
+    print(f"Saved comprehensive summary at {summary_csv_path}")
 
     # ------------------------------------------------------
-    # ORDER BY BEST BINDING TO TARGET (LOWEST ipSAE_min)
+    # ORDER BINDERS BY PRIMARY METRIC
     # ------------------------------------------------------
-    # Use only true targets (NOT antitargets) to measure "binding quality"
-    targets_only = agg_base[agg_base["target_type"] == "target"]
-
-    # If for some reason no targets exist, fall back to all partners
-    source = targets_only if not targets_only.empty else agg_base
-
-    # Binders ordered by highest ipSAE_min (bigger = better)
     binder_order = (
-        agg.groupby("binder_short")["ipSAE_min"]
-        .max()                        # biggest = best binding
-        .sort_values(ascending=False) # best → worst
+        agg.groupby("binder_short")[primary_metric]
+        .max()
+        .sort_values(ascending=False)
         .index
         .tolist()
     )
 
-    # Do NOT reorder rows (targets/antitargets)
-    type_map = agg_base.groupby("partner")["target_type"].first().to_dict()
-
-    # partner_order = antitargets + targets + self_group
     partner_order = ["self", "target", "antitarget"]
 
-    print("Partner order:", partner_order)
+    print(f"Primary metric for ordering: {primary_metric}")
+    print(f"Partner order: {partner_order}")
+    print(f"Binder order (best→worst by {primary_metric}): {binder_order}\n")
 
-    # Optional: print to verify in logs
-    print("Binder order (best→worst by ipSAE_min on targets):", binder_order,"\n")
     # ------------------------------------------------------
-    # PLOT HEATMAPS (BOTH USING ipSAE_min-BASED ORDERING)
+    # PLOT HEATMAPS FOR EACH METRIC
     # ------------------------------------------------------
-    for metric in metrics:
-        # ----------------------------------------------------------
+    for metric in available_heatmap_metrics:
+        if metric not in agg.columns:
+            continue
+
         # Replace partner names with their class
         agg["partner_class"] = agg["partner"].map(type_map)
 
@@ -478,6 +602,10 @@ def plot_overall(root_dir: Path, use_best_model: bool = False):
 
         plt.figure(figsize=(max(7, len(binder_order) * 0.7),
                             max(5, len(partner_order) * 0.4)))
+
+        # Determine appropriate vmax based on metric
+        vmax = 1.0 if metric.startswith("ipSAE") or metric.startswith("ipTM") or metric.startswith("pDockQ") else None
+
         sns.heatmap(
             pivot,
             annot=True,
@@ -486,36 +614,24 @@ def plot_overall(root_dir: Path, use_best_model: bool = False):
             cbar_kws={"label": metric},
             linewidths=0.5,
             vmin=0,
-            vmax=1,
+            vmax=vmax,
         )
-        plt.title(metric)
-        plt.ylabel("Self / Target / Antitarget ", rotation=90)
+        plt.title(f"{metric} (mean across models)")
+        plt.ylabel("Self / Target / Antitarget", rotation=90)
         plt.xlabel("Binder")
         plt.yticks(rotation=0)
-        # plt.tight_layout()
 
         for ext in ["png", "svg"]:
-            path = root_dir/ "summary"  / f"{metric}_heatmap.{ext}"
+            path = summary_dir / f"{metric}_heatmap.{ext}"
             plt.savefig(path, dpi=300, bbox_inches="tight")
             print(f"Saved heatmap for {metric} at {path}")
         plt.close()
 
-        # save CSV (rows = binders, columns = targets)
-        csv_out = root_dir/ "summary"  / f"{metric}_heatmap.csv"
-
-        # Add binder_sequence to the final exported heatmap CSV
-        # ----------------------------------------------------------
+        # Save CSV (rows = binders, columns = targets)
+        csv_out = summary_dir / f"{metric}_heatmap.csv"
         pivot_out = pivot.T.copy()  # rows = binders
-
-        pivot_out.insert(
-            0,
-            "binder_sequence",
-            pivot_out.index.map(binder_sequences)
-        )
-
-
+        pivot_out.insert(0, "binder_sequence", pivot_out.index.map(binder_sequences))
         pivot_out.to_csv(csv_out, float_format="%.5f")
-
         print(f"Saved heatmap data for {metric} as {csv_out}")
 
 def main():
