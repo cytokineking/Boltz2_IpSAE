@@ -36,12 +36,16 @@ Usage:
 """
 
 import csv
+import datetime
 import json
 import os
 import re
 import shutil
 import subprocess
 import tempfile
+import threading
+import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -51,6 +55,9 @@ app = modal.App("boltz2-ipsae")
 
 # Volume for caching model weights and CCD data (not for user outputs)
 cache_volume = modal.Volume.from_name("boltz-cache", create_if_missing=True)
+
+# Dict for real-time result streaming (immediate writes, 7-day TTL per entry)
+results_dict = modal.Dict.from_name("boltz-results", create_if_missing=True)
 
 # Supported GPU types with VRAM and hourly cost
 GPU_TYPES = {
@@ -136,7 +143,13 @@ def _run_boltz_and_ipsae_impl(task_dict: Dict[str, Any]) -> Dict[str, Any]:
 
     This is the actual logic, separated from the Modal decorator so we can
     have multiple GPU-specific wrapper functions.
+    
+    When stream_to_dict is True, results are written to the Modal Dict
+    immediately after each partner prediction completes, enabling real-time
+    sync to local filesystem.
     """
+    import time as time_module  # Local import to avoid issues
+    
     # Reconstruct task from dict
     binder_name = task_dict["binder_name"]
     binder_sequences = task_dict["binder_sequences"]
@@ -147,6 +160,10 @@ def _run_boltz_and_ipsae_impl(task_dict: Dict[str, Any]) -> Dict[str, Any]:
     dist_cutoff = task_dict.get("dist_cutoff", 15.0)
     use_msa_server = task_dict.get("use_msa_server", "auto")
     verbose = task_dict.get("verbose", False)
+    
+    # Streaming options
+    run_id = task_dict.get("run_id")
+    stream_to_dict = task_dict.get("stream_to_dict", False)
 
     work_dir = Path(tempfile.mkdtemp())
 
@@ -169,6 +186,8 @@ def _run_boltz_and_ipsae_impl(task_dict: Dict[str, Any]) -> Dict[str, Any]:
         print(f"Processing binder: {binder_name}")
         print(f"  Sequences: {len(binder_sequences)} chain(s)")
         print(f"  Partners: {len(partners)}")
+        if stream_to_dict:
+            print(f"  Streaming: enabled (run_id={run_id})")
         print(f"{'='*60}")
 
         # Process each partner
@@ -203,14 +222,55 @@ def _run_boltz_and_ipsae_impl(task_dict: Dict[str, Any]) -> Dict[str, Any]:
             else:
                 m = partner_result.get("metrics", {})
                 print(f"    ✓ ipSAE: {m.get('ipSAE_mean', 0):.3f} ± {m.get('ipSAE_std', 0):.3f}")
+            
+            # Stream result to Dict immediately after each partner completes
+            if stream_to_dict and run_id:
+                dict_key = f"{run_id}:{binder_name}:{partner_role}"
+                try:
+                    results_dict[dict_key] = {
+                        "run_id": run_id,
+                        "binder_name": binder_name,
+                        "partner_role": partner_role,
+                        "partner_name": partner_result.get("partner_name"),
+                        "n_models": partner_result.get("n_models", 0),
+                        "metrics": partner_result.get("metrics", {}),
+                        "per_model": partner_result.get("per_model", []),
+                        "structures": partner_result.get("structures", {}),
+                        "error": partner_result.get("error"),
+                        "timestamp": time_module.time(),
+                    }
+                    print(f"    → Streamed to Dict: {dict_key}")
+                except Exception as stream_err:
+                    print(f"    ⚠ Stream error: {stream_err}")
 
         results["status"] = "success"
+        
+        # Mark binder as complete in Dict
+        if stream_to_dict and run_id:
+            try:
+                results_dict[f"{run_id}:{binder_name}:_status"] = {
+                    "status": "complete",
+                    "timestamp": time_module.time(),
+                }
+            except Exception:
+                pass  # Non-critical
 
     except Exception as e:
         results["status"] = "error"
         results["error"] = str(e)
         import traceback
         print(f"Error processing {binder_name}: {traceback.format_exc()}")
+        
+        # Stream error status
+        if stream_to_dict and run_id:
+            try:
+                results_dict[f"{run_id}:{binder_name}:_status"] = {
+                    "status": "error",
+                    "error": str(e),
+                    "timestamp": time_module.time(),
+                }
+            except Exception:
+                pass
 
     finally:
         shutil.rmtree(work_dir, ignore_errors=True)
@@ -348,7 +408,11 @@ def _run_single_prediction(
             cmd.append("--use_msa_server")
 
         if verbose:
-            print(f"    Command: {' '.join(cmd)}")
+            print(f"    Boltz cmd: {' '.join(cmd)}")
+            if partner_msa:
+                print(f"    MSA: provided ({len(partner_msa)} chars), use_msa_server={should_use_msa}")
+            else:
+                print(f"    MSA: None, use_msa_server={should_use_msa}")
 
         boltz_result = subprocess.run(
             cmd,
@@ -652,6 +716,10 @@ def run_pipeline(
     # Output
     output_dir: Optional[str] = None,
     verbose: bool = False,
+    # Streaming options (streaming is ON by default)
+    no_stream: bool = False,
+    run_id: Optional[str] = None,
+    sync_interval: float = 5.0,
 ):
     """
     Run the full Boltz2 + ipSAE pipeline with parallel processing.
@@ -686,7 +754,17 @@ def run_pipeline(
             --binder-fasta-dir ./binders/ \\
             --target-fasta target.fasta \\
             --add-n-terminal-lysine
+            
+        # Disable real-time streaming (results only saved at end)
+        modal run modal_boltz_ipsae.py::run_pipeline \\
+            --binder-csv binders.csv \\
+            --target-fasta target.fasta \\
+            --output-dir ./results \\
+            --no-stream
     """
+    
+    # Convert no_stream flag to stream boolean for internal use
+    stream = not no_stream
 
     # Parse binders
     binders = _parse_binder_inputs(
@@ -744,6 +822,18 @@ def run_pipeline(
     output_path = Path(output_dir) if output_dir else None
     if output_path:
         output_path.mkdir(parents=True, exist_ok=True)
+    
+    # Setup streaming
+    effective_run_id = None
+    sync_thread = None
+    stop_sync = None
+    
+    if stream:
+        effective_run_id = run_id or datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+        if not output_path:
+            output_path = Path(f"./results_{effective_run_id}")
+            output_path.mkdir(parents=True, exist_ok=True)
+            print(f"Streaming enabled but no --output-dir specified. Using: {output_path}")
 
     # Print configuration
     print(f"\n{'='*70}")
@@ -758,6 +848,9 @@ def run_pipeline(
     print(f"GPU: {gpu}")
     print(f"Max parallel: {max_parallel}")
     print(f"Output: {output_path or 'stdout only'}")
+    if stream:
+        print(f"Streaming: ENABLED (run_id={effective_run_id})")
+        print(f"  Results will be saved to {output_path} as they complete")
     print(f"{'='*70}\n")
 
     # Build task list
@@ -785,6 +878,9 @@ def run_pipeline(
             "dist_cutoff": dist_cutoff,
             "use_msa_server": use_msa_server,
             "verbose": verbose,
+            # Streaming options
+            "run_id": effective_run_id,
+            "stream_to_dict": stream,
         }
         tasks.append(task)
 
@@ -798,11 +894,52 @@ def run_pipeline(
         return
     
     configured_fn = GPU_FUNCTIONS[gpu]
+    
+    # Start background sync thread if streaming enabled
+    if stream and output_path:
+        stop_sync = threading.Event()
+        sync_thread = threading.Thread(
+            target=_sync_worker,
+            args=(effective_run_id, output_path, stop_sync, sync_interval),
+            daemon=True,
+        )
+        sync_thread.start()
+        print(f"Background sync started (polling every {sync_interval}s)\n")
 
-    all_results = list(configured_fn.map(
-        tasks,
-        return_exceptions=True,
-    ))
+    # Execute tasks with concurrency limit
+    all_results = []
+    
+    def _run_task_safe(task_input):
+        """Run a single task safely, capturing exceptions."""
+        try:
+            return configured_fn.remote(task_input)
+        except Exception as e:
+            return e
+
+    print(f"Executing {len(tasks)} tasks (concurrency limit: {max_parallel})...")
+    
+    with ThreadPoolExecutor(max_workers=max_parallel) as executor:
+        futures = {executor.submit(_run_task_safe, t): t for t in tasks}
+        
+        # Wait for results as they complete
+        for i, future in enumerate(as_completed(futures)):
+            result = future.result()
+            all_results.append(result)
+            
+            # Print progress
+            if not isinstance(result, Exception):
+                name = result.get("binder_name", "unknown")
+                print(f"[{i+1}/{len(tasks)}] Finished: {name}")
+            else:
+                name = futures[future]["binder_name"]
+                print(f"[{i+1}/{len(tasks)}] Failed: {name}")
+
+    # Stop sync thread
+    if sync_thread is not None:
+        print("\nStopping background sync...")
+        stop_sync.set()
+        sync_thread.join(timeout=30)
+        print("Background sync stopped.")
 
     # Process results
     successful = []
@@ -1157,6 +1294,111 @@ def _save_harmonized_summary_csv(output_path: Path, results: List[Dict[str, Any]
 
 
 # =============================================================================
+# STREAMING SYNC FUNCTIONS
+# =============================================================================
+
+def _sync_worker(
+    run_id: str,
+    output_path: Path,
+    stop_event: threading.Event,
+    interval: float = 5.0,
+):
+    """
+    Background worker that polls the Modal Dict and saves results locally.
+    
+    Runs in a separate thread, polling every `interval` seconds until
+    `stop_event` is set.
+    """
+    synced_keys = set()
+    sync_count = 0
+    
+    while not stop_event.is_set():
+        try:
+            # Get all keys for this run
+            all_keys = [k for k in results_dict.keys() if k.startswith(f"{run_id}:")]
+            
+            # Find new keys (exclude status markers)
+            new_keys = [k for k in all_keys if k not in synced_keys and not k.endswith(":_status")]
+            
+            for key in new_keys:
+                try:
+                    result = results_dict[key]
+                    _save_streamed_result(output_path, result)
+                    synced_keys.add(key)
+                    sync_count += 1
+                    binder = result.get("binder_name", "?")
+                    role = result.get("partner_role", "?")
+                    print(f"  [SYNC] ✓ {binder}:{role} saved ({sync_count} total)")
+                except Exception as e:
+                    print(f"  [SYNC] ✗ Error syncing {key}: {e}")
+            
+        except Exception as e:
+            # Dict access can fail if not yet created, etc.
+            pass
+        
+        # Wait for next poll interval or stop signal
+        stop_event.wait(timeout=interval)
+    
+    # Final sync after stop signal
+    try:
+        all_keys = [k for k in results_dict.keys() if k.startswith(f"{run_id}:")]
+        new_keys = [k for k in all_keys if k not in synced_keys and not k.endswith(":_status")]
+        
+        for key in new_keys:
+            try:
+                result = results_dict[key]
+                _save_streamed_result(output_path, result)
+                synced_keys.add(key)
+                sync_count += 1
+            except Exception:
+                pass
+    except Exception:
+        pass
+    
+    print(f"  [SYNC] Final count: {sync_count} results synced")
+
+
+def _save_streamed_result(output_path: Path, result: Dict[str, Any]):
+    """Save a single streamed result from Dict to local filesystem."""
+    binder_name = result.get("binder_name", "unknown")
+    partner_role = result.get("partner_role", "unknown")
+    
+    binder_dir = output_path / f"binder_{binder_name}"
+    binder_dir.mkdir(parents=True, exist_ok=True)
+    
+    # Save structures
+    structures = result.get("structures", {})
+    if structures:
+        struct_dir = binder_dir / f"structures_{partner_role}"
+        struct_dir.mkdir(exist_ok=True)
+        for model_name, cif_content in structures.items():
+            cif_file = struct_dir / f"{binder_name}_vs_{partner_role}_{model_name}.cif"
+            cif_file.write_text(cif_content)
+    
+    # Update metrics JSON (append to existing or create new)
+    metrics_file = binder_dir / "metrics.json"
+    if metrics_file.exists():
+        try:
+            with open(metrics_file) as f:
+                metrics_data = json.load(f)
+        except Exception:
+            metrics_data = {"binder_name": binder_name, "status": "in_progress"}
+    else:
+        metrics_data = {"binder_name": binder_name, "status": "in_progress"}
+    
+    metrics_data[partner_role] = {
+        "partner_name": result.get("partner_name"),
+        "n_models": result.get("n_models", 0),
+        "metrics": result.get("metrics", {}),
+        "per_model": result.get("per_model", []),
+        "error": result.get("error"),
+    }
+    
+    with open(metrics_file, "w") as f:
+        json.dump(metrics_data, f, indent=2)
+
+
+# =============================================================================
 # UTILITY ENTRYPOINTS
 # =============================================================================
 
@@ -1253,3 +1495,156 @@ def convert_fasta_to_csv(
             writer.writerow([binder["name"], seq])
 
     print(f"Converted {len(binders)} sequences to: {csv_path}")
+
+
+@app.local_entrypoint()
+def sync_results(
+    run_id: str,
+    output_dir: str = "./results",
+    poll: bool = False,
+    interval: float = 5.0,
+    timeout: float = 3600.0,
+):
+    """
+    Sync results from Modal Dict to local filesystem.
+    
+    Use this to manually sync results or as a backup if streaming was interrupted.
+    
+    Usage:
+        # One-shot sync (get current results for a run)
+        modal run modal_boltz_ipsae.py::sync_results --run-id 20241129_143022
+        
+        # Continuous polling (run alongside pipeline if using --no-stream)
+        modal run modal_boltz_ipsae.py::sync_results --run-id 20241129_143022 --poll
+        
+        # Custom output directory and interval
+        modal run modal_boltz_ipsae.py::sync_results --run-id 20241129_143022 \\
+            --output-dir ./my_results --poll --interval 10
+    """
+    output_path = Path(output_dir)
+    output_path.mkdir(parents=True, exist_ok=True)
+    
+    synced_keys = set()
+    start_time = time.time()
+    
+    print(f"Syncing results for run: {run_id}")
+    print(f"Output directory: {output_path}")
+    if poll:
+        print(f"Polling every {interval}s (timeout: {timeout}s)")
+        print("Press Ctrl+C to stop\n")
+    
+    while True:
+        try:
+            all_keys = [k for k in results_dict.keys() if k.startswith(f"{run_id}:")]
+        except Exception as e:
+            print(f"Error listing keys: {e}")
+            if not poll:
+                break
+            time.sleep(interval)
+            continue
+        
+        new_keys = [k for k in all_keys if k not in synced_keys and not k.endswith(":_status")]
+        
+        for key in new_keys:
+            try:
+                result = results_dict[key]
+                _save_streamed_result(output_path, result)
+                synced_keys.add(key)
+                binder = result.get("binder_name", "?")
+                role = result.get("partner_role", "?")
+                print(f"✓ {binder}:{role}")
+            except Exception as e:
+                print(f"✗ Error syncing {key}: {e}")
+        
+        if not poll:
+            break
+        
+        if time.time() - start_time > timeout:
+            print(f"\nTimeout reached ({timeout}s)")
+            break
+        
+        time.sleep(interval)
+    
+    print(f"\nSynced {len(synced_keys)} results to {output_path}")
+
+
+@app.local_entrypoint()
+def list_runs():
+    """
+    List all run IDs in the results Dict.
+    
+    Usage:
+        modal run modal_boltz_ipsae.py::list_runs
+    """
+    try:
+        all_keys = list(results_dict.keys())
+    except Exception as e:
+        print(f"Error: {e}")
+        return
+    
+    if not all_keys:
+        print("No runs found in results Dict.")
+        return
+    
+    # Extract unique run IDs and count entries
+    run_counts = {}
+    for key in all_keys:
+        parts = key.split(":")
+        if len(parts) >= 1:
+            rid = parts[0]
+            run_counts[rid] = run_counts.get(rid, 0) + 1
+    
+    print("Available runs in Dict:")
+    print("=" * 50)
+    for rid in sorted(run_counts.keys()):
+        print(f"  {rid}: {run_counts[rid]} entries")
+    print(f"\nTotal: {len(run_counts)} runs, {len(all_keys)} entries")
+
+
+@app.local_entrypoint()
+def clear_results(
+    run_id: Optional[str] = None,
+    confirm: bool = False,
+):
+    """
+    Clear results from the Dict.
+    
+    Usage:
+        # Clear specific run
+        modal run modal_boltz_ipsae.py::clear_results --run-id 20241129_143022 --confirm
+        
+        # Clear ALL results (use with caution!)
+        modal run modal_boltz_ipsae.py::clear_results --confirm
+    """
+    if not confirm:
+        print("This will delete results from the Dict.")
+        print("Add --confirm to proceed.")
+        if run_id:
+            print(f"Target: run_id={run_id}")
+        else:
+            print("Target: ALL runs (dangerous!)")
+        return
+    
+    try:
+        all_keys = list(results_dict.keys())
+    except Exception as e:
+        print(f"Error: {e}")
+        return
+    
+    if run_id:
+        keys_to_delete = [k for k in all_keys if k.startswith(f"{run_id}:")]
+    else:
+        keys_to_delete = all_keys
+    
+    if not keys_to_delete:
+        print("No matching entries found.")
+        return
+    
+    print(f"Deleting {len(keys_to_delete)} entries...")
+    for key in keys_to_delete:
+        try:
+            del results_dict[key]
+        except Exception:
+            pass
+    
+    print(f"Deleted {len(keys_to_delete)} entries.")
