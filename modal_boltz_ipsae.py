@@ -597,20 +597,47 @@ def _run_ipsae(
     return _parse_ipsae_output(output_content)
 
 
+def _is_binder_partner_pair(chain1: str, chain2: str) -> bool:
+    """
+    Check if this is a binder-to-partner chain pair (not internal target/binder pairs).
+    
+    Chain naming convention:
+    - Binder chains: single letters (A, B, C, ...)
+    - Partner chains: prefixed (TA, TB for target; XA, XB for antitarget; SA, SB for self)
+    
+    Returns True if one chain is a binder and the other is a partner.
+    """
+    # Binder chains are single letters A-Z
+    def is_binder_chain(c):
+        return len(c) == 1 and c.isalpha()
+    
+    # Partner chains start with T, X, or S prefix
+    def is_partner_chain(c):
+        return len(c) >= 2 and c[0] in ('T', 'X', 'S') and c[1:].isalpha()
+    
+    # Valid pair: one binder + one partner (either direction)
+    return (is_binder_chain(chain1) and is_partner_chain(chain2)) or \
+           (is_partner_chain(chain1) and is_binder_chain(chain2))
+
+
 def _parse_ipsae_output(output: str) -> Dict[str, Any]:
     """
-    Parse ipSAE output file to extract all metrics.
+    Parse ipSAE output file to extract metrics for BINDER-to-PARTNER interfaces only.
+    
+    IMPORTANT: Excludes internal target chain pairs (e.g., TA-TB for multi-chain targets)
+    which would otherwise inflate scores with native interface metrics.
 
     The output format is:
     Chn1 Chn2  PAE Dist  Type   ipSAE    ipSAE_d0chn ipSAE_d0dom  ipTM_af  ...
     A    TA    15  15    asym   0.1234   ...
     A    TA    15  15    max    0.1234   ...
+    TA   TB    15  15    max    0.9500   ...  <- EXCLUDED (target internal)
     """
     metrics = {}
 
     lines = output.strip().split("\n")
-    asym_values = []
-    max_row = None
+    binder_partner_max_rows = []  # Collect all binder-partner max rows
+    binder_partner_asym_values = []
 
     for line in lines:
         line = line.strip()
@@ -622,10 +649,18 @@ def _parse_ipsae_output(output: str) -> Dict[str, Any]:
             continue
 
         try:
+            chain1 = parts[0]
+            chain2 = parts[1]
             row_type = parts[4].lower()
+            
+            # Skip non-binder-partner pairs (e.g., target internal interfaces)
+            if not _is_binder_partner_pair(chain1, chain2):
+                continue
 
             if row_type == "max":
-                max_row = {
+                row_data = {
+                    "chain1": chain1,
+                    "chain2": chain2,
                     "ipSAE": float(parts[5]),
                     "ipSAE_d0chn": float(parts[6]),
                     "ipSAE_d0dom": float(parts[7]),
@@ -635,21 +670,28 @@ def _parse_ipsae_output(output: str) -> Dict[str, Any]:
                     "LIS": float(parts[12]),
                 }
                 if len(parts) > 13:
-                    max_row["n0res"] = int(parts[13])
+                    row_data["n0res"] = int(parts[13])
                 if len(parts) > 14:
-                    max_row["n0chn"] = int(parts[14])
+                    row_data["n0chn"] = int(parts[14])
+                binder_partner_max_rows.append(row_data)
+                
             elif row_type == "asym":
-                asym_values.append(float(parts[5]))
+                binder_partner_asym_values.append(float(parts[5]))
 
         except (ValueError, IndexError):
             continue
 
-    if max_row:
-        metrics.update(max_row)
+    # Take the best (max ipSAE) among binder-partner pairs
+    if binder_partner_max_rows:
+        best_row = max(binder_partner_max_rows, key=lambda r: r["ipSAE"])
+        # Remove chain info before returning
+        best_row.pop("chain1", None)
+        best_row.pop("chain2", None)
+        metrics.update(best_row)
 
-    if asym_values:
-        metrics["ipSAE_min"] = min(asym_values)
-        metrics["ipSAE_max"] = max(asym_values)
+    if binder_partner_asym_values:
+        metrics["ipSAE_min"] = min(binder_partner_asym_values)
+        metrics["ipSAE_max"] = max(binder_partner_asym_values)
 
     return metrics
 
